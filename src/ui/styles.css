@@ -120,8 +120,9 @@ input { color: var(--text); }
 .editor-loading { margin: 35px 42px; color: var(--faint); font-size: 12px; }
 .month-divider { margin: 5px 42px 22px; padding: 13px 0 8px; border-bottom: 1px solid var(--line); font-family: var(--font-body); color: var(--faint); font-size: 11px; letter-spacing: .04em; user-select: none; }
 .cm-heading { font-weight: 600; color: #e8e9e8; padding-top: 9px!important; padding-bottom: 4px!important; }
-.cm-heading-1 { font-size: 21px; margin-top: 9px; }
-.cm-heading-2 { font-size: 17px; margin-top: 6px; }
+/* Vertical margins fall outside CodeMirror's line height measurements. */
+.cm-heading-1 { font-size: 21px; padding-top: 18px!important; }
+.cm-heading-2 { font-size: 17px; padding-top: 15px!important; }
 .cm-heading-3 { font-size: 15px; }
 .cm-preview-strong { font-weight: 650; color: #e6e9e7; }
 .cm-preview-emphasis { font-style: italic; }

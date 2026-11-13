@@ -319,6 +319,35 @@ async function caretPosition(editor: import('@playwright/test').Locator) {
     return { line: [...element.querySelectorAll('.cm-line')].indexOf(line), offset: prefix.toString().length, x: bounds.x, y: bounds.y };
   });
 }
+for (const list of [true, false]) test(`見出しの余白で${list ? '箇条書き' : '通常本文'}の上下移動が見出しまで飛ばない`, async ({ page }) => {
+  // Walk every line in both directions, including off-screen content.
+  test.setTimeout(60_000);
+  const content = Array.from({ length: 12 }, (_, index) => {
+    const number = index + 1, prefix = list ? '- ' : '';
+    return `# 大見出し ${number}\n\n本文 A ${number}\n## 小見出し ${number}\n${prefix}項目 A ${number}\n${prefix}項目 B ${number}\n\n本文 B ${number}\n`;
+  }).join('\n');
+  const lines = content.split('\n'), editor = await openMarkdown(page, content);
+  async function currentLine() {
+    return editor.evaluate(() => {
+      const anchor = window.getSelection()?.anchorNode;
+      return (anchor instanceof Element ? anchor : anchor?.parentElement)?.closest('.cm-line')?.textContent;
+    });
+  }
+  await editor.press('Control+End');
+  for (let line = lines.length - 2; line >= 0; line--) {
+    await editor.press('ArrowUp');
+    await expect.poll(currentLine, { message: `上キーで${line + 1}行目へ移動する` }).toBe(lines[line]);
+  }
+  for (let line = 1; line < lines.length; line++) {
+    await editor.press('ArrowDown');
+    await expect.poll(currentLine, { message: `下キーで${line + 1}行目へ移動する` }).toBe(lines[line]);
+  }
+  const lastItem = editor.locator('.cm-line').filter({ hasText: `${list ? '- ' : ''}項目 A 12` });
+  await lastItem.click(); await expect.poll(currentLine).toBe(`${list ? '- ' : ''}項目 A 12`);
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(content);
+});
+
 test('箇条書きの上下移動で行や文字位置を飛ばさず、折り返しでも往復できる', async ({ page }) => {
   const editor = await openMarkdown(page, Array(6).fill('- 同じ項目の本文').join('\n'));
   for (const column of [2, 3, 5, 9]) {

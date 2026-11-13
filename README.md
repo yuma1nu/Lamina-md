@@ -6,9 +6,9 @@ Windows向けの個人用Markdownエディタ。技術開発のテーマ別記�
 
 ## Windowsへのインストール
 
-[GitHub Releases](https://github.com/yuma1nu/Lamina-md/releases)から`Lamina.md_0.1.0_x64-setup.exe`をダウンロードして実行する。Windows x64向けで、現在のユーザーにインストールする。インストーラーは日本語・英語に対応し、WebView2が未導入の場合はダウンロードするためインターネット接続が必要。
+[GitHub Releases](https://github.com/yuma1nu/Lamina-md/releases)から`Lamina.md_0.1.1_x64-setup.exe`をダウンロードして実行する。Windows x64向けで、現在のユーザーにインストールする。インストーラーは日本語・英語に対応し、WebView2が未導入の場合はダウンロードするためインターネット接続が必要。
 
-初期開発版 v0.1.0。インストーラーはコード署名していないため、Windowsの保護機能によって確認が表示される場合がある。実装済みの機能と未実装・未確認の項目は以下を参照。
+初期開発版 v0.1.1。インストーラーはコード署名していないため、Windowsの保護機能によって確認が表示される場合がある。実装済みの機能と未実装・未確認の項目は以下を参照。
 
 2026-11-12に初期実装へ着手した。日々の編集基盤、ノートリンク・検索・移動追従、画像表示・注釈編集に加え、資料リンクの登録・一覧・参照元・パス修正・統合を実装した。自動PDFなど、初期版全体は開発中。
 
@@ -135,11 +135,11 @@ cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- build -- --locked
 ```
 
-2026-11-13時点ではフロントエンドの型検査・本番ビルド、単体テスト65件、ブラウザ操作テスト67件が通過。編集・保存・リンク・画像・注釈、箇条書きの上下移動と字下げ、右ペインの終了に加え、矢印・直線の端点編集、メモのドラッグ整理とフォルダー内作成を確認。回転付きの旧データ、反対側の固定、ズーム中の操作、Undo／Redo、キャンセル、保存・再起動後の再編集を含む。Rust 1.99.1／Cargo 1.99.1（stable-x86_64-pc-windows-msvc）をユーザープロファイルへ導入し、Rust依存関係を取得済み。WebView2も検出済み。
+2026-11-13時点ではフロントエンドの型検査・本番ビルド、単体テスト65件、ブラウザ操作テスト69件が通過。編集・保存・リンク・画像・注釈、箇条書きの上下移動と字下げ、右ペインの終了に加え、矢印・直線の端点編集、メモのドラッグ整理とフォルダー内作成を確認。回転付きの旧データ、反対側の固定、ズーム中の操作、Undo／Redo、キャンセル、保存・再起動後の再編集を含む。Rust 1.99.1／Cargo 1.99.1（stable-x86_64-pc-windows-msvc）をユーザープロファイルへ導入し、Rust依存関係を取得済み。WebView2も検出済み。
 
 既存のVisual Studio 2022へMSVC x64/x86ビルドツールとWindows SDK 10.0.26100を追加済み。MSVC 14.44.35207のヘッダー・標準ライブラリを確認し、インストーラーは正常終了した。Windowsの再起動要求はない。
 
-Windows上でRustテスト24件が通過。実ファイルの保存・追跡・移動・監視に加え、画像保存・再読込・古いリビジョンの拒否・注釈とPNGの途中更新からの復旧・外部変更の保護を含む。Tauriのリリースビルドも成功し、`src-tauri/target/release/lamina-md.exe`を更新済み。配布用NSISインストーラーは`src-tauri/target/release/bundle/nsis/Lamina.md_0.1.0_x64-setup.exe`へ生成する。実機の確認は専用の保管庫とWebView2プロフィールを使い、普段の保管庫・前回の保管庫設定とは分離して実施した。
+Windows上でRustテスト24件が通過。実ファイルの保存・追跡・移動・監視に加え、画像保存・再読込・古いリビジョンの拒否・注釈とPNGの途中更新からの復旧・外部変更の保護を含む。Tauriのリリースビルドも成功し、`src-tauri/target/release/lamina-md.exe`を更新済み。配布用NSISインストーラーは`src-tauri/target/release/bundle/nsis/Lamina.md_0.1.1_x64-setup.exe`へ生成する。実機の確認は専用の保管庫とWebView2プロフィールを使い、普段の保管庫・前回の保管庫設定とは分離して実施した。
 
 追加対象は[scripts/windows-build.vsconfig](scripts/windows-build.vsconfig)に記録した。同じ構成が必要な別の開発PCでは、VS 2022のインストール後にPowerShellから`& .\scripts\install-cpp-tools.ps1`を実行できる。Windowsの管理者確認が必要で、インストーラーは自動再起動しない。
 
