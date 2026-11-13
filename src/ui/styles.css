@@ -118,7 +118,8 @@ input { color: var(--text); }
 .document-heading h1 { font-weight: 600; font-size: 25px; letter-spacing: -.5px; line-height: 1.5; margin: 9px 0 0; color: #eceef0; overflow-wrap: anywhere; }
 .editor-mount { flex: 1; min-height: 0; font-size: 14px; }
 .editor-loading { margin: 35px 42px; color: var(--faint); font-size: 12px; }
-.month-divider { margin: 5px 42px 22px; padding: 13px 0 8px; border-bottom: 1px solid var(--line); font-family: var(--font-body); color: var(--faint); font-size: 11px; letter-spacing: .04em; user-select: none; }
+.month-divider { margin: 0 42px; padding: 5px 0 22px; font-family: var(--font-body); color: var(--faint); font-size: 11px; letter-spacing: .04em; user-select: none; }
+.month-divider-label { padding: 13px 0 8px; border-bottom: 1px solid var(--line); }
 .cm-heading { font-weight: 600; color: #e8e9e8; padding-top: 9px!important; padding-bottom: 4px!important; }
 /* Vertical margins fall outside CodeMirror's line height measurements. */
 .cm-heading-1 { font-size: 21px; padding-top: 18px!important; }

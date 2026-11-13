@@ -25,7 +25,10 @@ class MonthWidget extends WidgetType {
   toDOM() {
     const element = document.createElement('div');
     element.className = 'month-divider';
-    element.textContent = this.label.replace(/^(\d{4})-(\d{2})$/, (_, year: string, month: string) => `${year}年${Number(month)}月`);
+    const label = document.createElement('div');
+    label.className = 'month-divider-label';
+    label.textContent = this.label.replace(/^(\d{4})-(\d{2})$/, (_, year: string, month: string) => `${year}年${Number(month)}月`);
+    element.append(label);
     return element;
   }
   ignoreEvent() { return true; }

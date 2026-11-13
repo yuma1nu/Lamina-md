@@ -348,6 +348,49 @@ for (const list of [true, false]) test(`見出しの余白で${list ? '箇条書
   expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(content);
 });
 
+for (const count of [1, 4]) test(`テーマの${count}か月表示で月ラベルによる上下移動・クリックの位置ずれを起こさない`, async ({ page }) => {
+  await connectTestVault(page);
+  const months = ['08', '09', '10', '11'].slice(0, count).map(month => ({
+    path: `テーマ/耐久性評価/2026-${month}.md`, month,
+    content: `# 2026-${month}-01\n\n## 条件 ${month}\n- 項目 A ${month}\n- 項目 B ${month}\n\n本文 A ${month}\n本文 B ${month}`,
+  }));
+  await page.evaluate(months => {
+    const files = window.__laminaFixture.files;
+    for (const path of Object.keys(files)) if (path.startsWith('テーマ/耐久性評価/')) delete files[path];
+    for (const month of months) files[month.path] = { content: month.content, revision: month.path };
+  }, months);
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click();
+  await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  await expect(editor.locator('.month-divider')).toHaveCount(count);
+  async function currentLine() {
+    return editor.evaluate(() => {
+      const anchor = window.getSelection()?.anchorNode;
+      return (anchor instanceof Element ? anchor : anchor?.parentElement)?.closest('.cm-line')?.textContent;
+    });
+  }
+  const lines = months.flatMap(month => month.content.split('\n'));
+  await editor.press('Control+End');
+  for (let line = lines.length - 2; line >= 0; line--) {
+    await editor.press('ArrowUp');
+    await expect.poll(currentLine, { message: `テーマの上キー移動先：${lines[line]}` }).toBe(lines[line]);
+  }
+  for (let line = 1; line < lines.length; line++) {
+    await editor.press('ArrowDown');
+    await expect.poll(currentLine, { message: `テーマの下キー移動先：${lines[line]}` }).toBe(lines[line]);
+  }
+  await page.getByRole('tab', { name: '目次', exact: true }).click();
+  const outline = page.getByRole('navigation', { name: '本文の目次', exact: true });
+  for (const month of months) {
+    await outline.getByRole('button', { name: `条件 ${month.month}`, exact: true }).click();
+    await editor.locator('.cm-line').filter({ hasText: `本文 B ${month.month}` }).click();
+    await expect.poll(currentLine).toBe(`本文 B ${month.month}`);
+  }
+  await editor.press('Control+s');
+  for (const month of months) expect(await page.evaluate(path => window.__laminaFixture.files[path].content, month.path)).toBe(month.content);
+});
+
 test('箇条書きの上下移動で行や文字位置を飛ばさず、折り返しでも往復できる', async ({ page }) => {
   const editor = await openMarkdown(page, Array(6).fill('- 同じ項目の本文').join('\n'));
   for (const column of [2, 3, 5, 9]) {
