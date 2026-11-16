@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
-import { ChevronRight, FileText, FilePlus2, Folder, FolderPlus, FolderUp, MoreHorizontal, Pencil, FolderInput, Scissors, Search, RefreshCw, X, Link2, List } from 'lucide-react';
+import { ChevronRight, FileText, FilePlus2, Folder, FolderPlus, FolderUp, MoreHorizontal, Pencil, FolderInput, Scissors, Search, RefreshCw, X, Link2, List, Trash2 } from 'lucide-react';
 import { useWorkspace, workspace } from './workspace';
 import { decode, newNotePath, referenceHits, searchNotes } from '../domain/note-links';
 import { type FileEntry, type OpenDocument } from '../domain/documents';
@@ -8,16 +8,17 @@ import { MaterialBacklinks } from '../features/materials/MaterialsView';
 import { materialReferences, readMaterial, type Material } from '../domain/materials';
 import { outlineHeadings } from '../domain/outline';
 
-export interface EditRequest { type: 'rename' | 'move' | 'folder' | 'extract' | 'note'; path: string }
+export interface EditRequest { type: 'rename' | 'move' | 'folder' | 'extract' | 'note' | 'delete'; path: string }
 export const openMode = (event: MouseEvent) => ({ pane: event.ctrlKey && event.altKey ? 1 as const : useWorkspace.getState().activePane, newTab: event.ctrlKey || event.metaKey || event.button === 1 });
 
 export function ItemActions({ path, onEdit, folder = false }: { path: string; onEdit: (request: EditRequest) => void; folder?: boolean }) {
   const ref = useRef<HTMLDetailsElement>(null);
   useEffect(() => { const close = (event: PointerEvent) => { if (!ref.current?.contains(event.target as Node) && ref.current) ref.current.open = false; }; window.addEventListener('pointerdown', close); return () => window.removeEventListener('pointerdown', close); }, []);
-  return <details className="item-actions" ref={ref}><summary aria-label={`${path}の操作`} title="名前変更・移動"><MoreHorizontal size={15} /></summary><div role="menu" aria-label={`${path}の操作メニュー`}>
+  return <details className="item-actions" ref={ref}><summary aria-label={`${path}の操作`} title="メニュー"><MoreHorizontal size={15} /></summary><div role="menu" aria-label={`${path}の操作メニュー`}>
     {folder && <><button role="menuitem" onClick={() => { ref.current!.open = false; onEdit({ type: 'note', path }); }}><FilePlus2 size={14} />メモを追加</button><button role="menuitem" onClick={() => { ref.current!.open = false; onEdit({ type: 'folder', path }); }}><FolderPlus size={14} />子フォルダーを作成</button><div className="menu-separator" /></>}
     <button role="menuitem" onClick={() => { ref.current!.open = false; onEdit({ type: 'rename', path }); }}><Pencil size={14} />名前を変更</button>
     <button role="menuitem" onClick={() => { ref.current!.open = false; onEdit({ type: 'move', path }); }}><FolderInput size={14} />移動</button>
+    {!folder && path.startsWith('メモ/') && /\.md$/i.test(path) && <><div className="menu-separator" /><button className="delete-action" role="menuitem" onClick={() => { ref.current!.open = false; onEdit({ type: 'delete', path }); }}><Trash2 size={14} />メモを削除</button></>}
   </div></details>;
 }
 
@@ -145,7 +146,7 @@ export function WorkspaceDialog({ request, close }: { request: EditRequest | nul
     if (!ref.current?.open) ref.current?.showModal();
     input.current?.focus(); input.current?.select();
   }, [request, missing]);
-  function dismiss() { close(); useWorkspace.setState({ missingLink: null }); }
+  function dismiss() { if (working) return; close(); useWorkspace.setState({ missingLink: null }); }
   async function submit(event: FormEvent) {
     event.preventDefault(); setWorking(true);
     let ok = false;
@@ -156,17 +157,18 @@ export function WorkspaceDialog({ request, close }: { request: EditRequest | nul
       else if (request.type === 'move') { const folder = value.trim().replace(/\/$/, ''); ok = await workspace.relocate(source, (folder.startsWith(root) ? folder : root + '/' + folder) + '/' + leaf); }
       else if (request.type === 'folder') ok = await workspace.createChildFolder(request.path || 'メモ', value.trim());
       else if (request.type === 'note') ok = await workspace.createNoteInFolder(request.path || 'メモ', value.trim());
+      else if (request.type === 'delete') ok = await workspace.deleteNote(request.path);
       else ok = await workspace.extractSelection(value.trim());
     }
-    setWorking(false); if (ok) dismiss();
+    setWorking(false); if (ok) { close(); useWorkspace.setState({ missingLink: null }); }
   }
   let missingPath = '';
   try { if (missing) missingPath = newNotePath(missing.target, missing.sourcePath); } catch { missingPath = decode(missing?.target ?? ''); }
-  const title = !request ? 'リンク先のメモがありません' : { rename: '名前を変更', move: '移動', folder: '新しいメモフォルダー', extract: '選択範囲をメモに切り出す', note: '新しいメモ' }[request.type];
+  const title = !request ? 'リンク先のメモがありません' : { rename: '名前を変更', move: '移動', folder: '新しいメモフォルダー', extract: '選択範囲をメモに切り出す', note: '新しいメモ', delete: 'メモを削除' }[request.type];
   const label = request?.type === 'move' ? '移動先のフォルダー' : request?.type === 'extract' ? '新しいメモのタイトル' : request?.type === 'note' ? 'メモのタイトル' : '名前';
-  return <dialog className="create-dialog" ref={ref} aria-label={title} onCancel={dismiss} onClose={() => { if (!working) dismiss(); }}><form onSubmit={event => void submit(event)}><div className="dialog-heading"><h2>{title}</h2><button className="icon-button" aria-label="閉じる" type="button" onClick={dismiss} disabled={working}><X size={18} /></button></div>{request ? <label>{label}<input ref={input} aria-label={label} value={value} onChange={event => setValue(event.target.value)} disabled={working} maxLength={180} /></label> : <p className="missing-target">{missingPath}</p>}
-      {request?.type === 'extract' ? <><p>元の位置をリンクに置き換えます。</p><pre className="selection-preview">{state.selectionText.slice(0, 600)}</pre></> : request?.type === 'move' ? <p>現在：{request.path}<br />フォルダーがなければ作成します。</p> : request?.type === 'rename' ? <p>参照元のリンクも更新します。指定した別名は保持します。</p> : !request ? <p>このメモを作成して、そのまま開きます。</p> : <p className="creation-location">作成先：{request.path || 'メモ'}<br />{request.type === 'note' ? '作成後、そのまま本文を編集できます。' : 'メモをまとめるフォルダーを作成します。'}</p>}
-      <footer><button className="button" type="button" onClick={dismiss} disabled={working}>キャンセル</button><button className="button primary" disabled={working || !!request && !value.trim()}>{!request ? 'メモを作成' : request.type === 'extract' ? '切り出す' : request.type === 'move' ? '移動' : request.type === 'rename' ? '変更' : '作成'}</button></footer></form></dialog>;
+  return <dialog className="create-dialog" ref={ref} aria-label={title} onCancel={event => { if (working) event.preventDefault(); else dismiss(); }} onClose={() => { if (!working) dismiss(); }}><form onSubmit={event => void submit(event)}><div className="dialog-heading"><h2>{title}</h2><button className="icon-button" aria-label="閉じる" type="button" onClick={dismiss} disabled={working}><X size={18} /></button></div>{request?.type === 'delete' ? <><p className="missing-target">{request.path}</p><p>このメモを一覧から削除します。削除したファイルは保管庫の .lamina/trash に退避します。添付画像や資料本体は削除しません。</p>{referenceHits(workspace.index(), request.path).length > 0 && <p>このメモへの参照が{referenceHits(workspace.index(), request.path).length}件あります。参照元のリンクは残り、リンク先が見つからない状態になります。</p>}</> : request ? <label>{label}<input ref={input} aria-label={label} value={value} onChange={event => setValue(event.target.value)} disabled={working} maxLength={180} /></label> : <p className="missing-target">{missingPath}</p>}
+      {request?.type === 'delete' ? null : request?.type === 'extract' ? <><p>元の位置をリンクに置き換えます。</p><pre className="selection-preview">{state.selectionText.slice(0, 600)}</pre></> : request?.type === 'move' ? <p>現在：{request.path}<br />フォルダーがなければ作成します。</p> : request?.type === 'rename' ? <p>参照元のリンクも更新します。指定した別名は保持します。</p> : !request ? <p>このメモを作成して、そのまま開きます。</p> : <p className="creation-location">作成先：{request.path || 'メモ'}<br />{request.type === 'note' ? '作成後、そのまま本文を編集できます。' : 'メモをまとめるフォルダーを作成します。'}</p>}
+      <footer><button className="button" type="button" onClick={dismiss} disabled={working}>キャンセル</button><button className={`button ${request?.type === 'delete' ? 'danger' : 'primary'}`} disabled={working || !!request && request.type !== 'delete' && !value.trim()}>{!request ? 'メモを作成' : request.type === 'delete' ? '削除する' : request.type === 'extract' ? '切り出す' : request.type === 'move' ? '移動' : request.type === 'rename' ? '変更' : '作成'}</button></footer></form></dialog>;
 }
 
 export function FolderButton({ onEdit }: { onEdit: (request: EditRequest) => void }) { return <button className="icon-button" aria-label="メモのフォルダーを作成" title="メモのフォルダーを作成" onClick={() => onEdit({ type: 'folder', path: 'メモ' })}><FolderPlus size={14} /></button>; }

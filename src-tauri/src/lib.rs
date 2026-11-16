@@ -5,6 +5,7 @@ mod operations;
 mod watching;
 mod images;
 mod resources;
+mod trash;
 
 use std::sync::Mutex;
 use tauri::State;
@@ -97,6 +98,11 @@ async fn apply_operation(operation: operations::Operation, state: State<'_, Vaul
     guard.as_ref().ok_or("保管庫を開いてください。")?.apply_operation(operation)
 }
 #[tauri::command]
+async fn trash_note(path: String, expected_revision: String, state: State<'_, VaultState>) -> Result<catalog::Catalog, String> {
+    let guard = state.0.lock().map_err(|_| "保管庫の状態を取得できません。")?;
+    guard.as_ref().ok_or("保管庫を開いてください。")?.trash_note(&path, &expected_revision)
+}
+#[tauri::command]
 async fn watch_vault(state: State<'_, VaultState>, watch: State<'_, watching::WatchState>, app: tauri::AppHandle) -> Result<(), String> {
     let root = state.0.lock().map_err(|_| "保管庫の状態を取得できません。")?.as_ref().ok_or("保管庫を開いてください。")?.root.to_string_lossy().to_string();
     let watcher = watching::watch(root, app)?;
@@ -125,7 +131,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .manage(VaultState::default())
         .manage(watching::WatchState::default())
-        .invoke_handler(tauri::generate_handler![open_vault, read_document, save_document, create_theme, create_note, read_workspace, save_workspace, open_web_link, read_catalog, apply_operation, watch_vault, read_image, write_image, inspect_resource, read_resource_clipboard, read_dropped_image, open_resource])
+        .invoke_handler(tauri::generate_handler![open_vault, read_document, save_document, create_theme, create_note, read_workspace, save_workspace, open_web_link, read_catalog, apply_operation, trash_note, watch_vault, read_image, write_image, inspect_resource, read_resource_clipboard, read_dropped_image, open_resource])
         .run(tauri::generate_context!())
         .expect("Lamina.mdの起動に失敗しました");
 }

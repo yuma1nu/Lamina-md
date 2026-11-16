@@ -5,6 +5,8 @@ import type { ImageFile, ImageWrite } from '../../src/domain/images';
 import { materialDraft, writeMaterial } from '../../src/domain/materials';
 
 interface TestFixture {
+  trash?: Record<string, { content: string; revision: string }>;
+  trashFailure?: boolean;
   images: Record<string, ImageFile>;
   files: Record<string, { content: string; revision: string; identity?: string }>;
   failure: boolean;
@@ -95,6 +97,14 @@ async function connectTestVault(page: Page) {
           if (command === 'inspect_resource') return { title: String(args.path).split(/[\\/]/).at(-1), folder: fixture.resourceFolders?.includes(String(args.path)) ?? false, exists: true };
           if (command === 'open_resource') { if (fixture.openFailure) throw new Error('資料を起動できませんでした'); fixture.openedUrls.push(String(args.path)); return; }
           if (command === 'read_catalog') return catalog();
+          if (command === 'trash_note') {
+            const path = String(args.path);
+            if (fixture.trashFailure) throw new Error('削除のテスト用失敗');
+            if (!path.startsWith('メモ/') || files[path]?.revision !== args.expectedRevision) throw new Error('削除するメモに外部変更があります');
+            fixture.trash ??= {}; fixture.trash[path] = structuredClone(files[path]); delete files[path];
+            fixture.operations.push('trash'); persistDisk(); localStorage.setItem('lamina.test.tracking', JSON.stringify(currentEntries()));
+            return catalog();
+          }
           if (command === 'apply_operation') {
             if (fixture.operationFailure) throw new Error('操作のテスト用保存失敗');
             const operation = args.operation as unknown as Operation;
@@ -186,6 +196,114 @@ test('実ファイル境界を代替したIPC経由で月別編集・保存・�
   await expect(page.locator('.cm-heading-1')).toHaveCount(3);
   expect(errors).toEqual([]);
   await page.screenshot({ path: '.tools/qa/workspace.png' });
+});
+
+test('Ctrl+Tab・数字・Ctrl+W・Ctrl+Shift+Tで保存しながらタブを操作できる', async ({ page }) => {
+  await connectTestVault(page);
+  await page.getByRole('button', { name: '耐久性評価', exact: true }).click();
+  await page.getByRole('button', { name: 'ピン留め', exact: true }).click();
+  await page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true }).click({ modifiers: ['Control'] });
+  await page.getByRole('button', { name: '資料一覧', exact: true }).click();
+  const active = (name: string) => page.getByRole('tab', { name, exact: true });
+  await page.keyboard.press('Control+Tab'); await expect(active('耐久性評価')).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('textbox', { name: '耐久性評価の本文', exact: true })).toBeFocused();
+  await page.keyboard.press('Control+Shift+Tab'); await expect(active('資料一覧')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+PageUp'); await expect(active('試験の手順')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+1'); await expect(active('耐久性評価')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+9'); await expect(active('資料一覧')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+w'); await expect(active('資料一覧')).toHaveCount(0);
+  await expect(active('試験の手順')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+Shift+t'); await expect(active('資料一覧')).toHaveAttribute('aria-selected', 'true');
+  await page.keyboard.press('Control+2');
+  const editor = page.getByRole('textbox', { name: '試験の手順の本文', exact: true });
+  await expect(editor).toBeFocused(); await editor.press('Control+End'); await page.keyboard.insertText('閉じる前の追記');
+  await editor.press('Control+w'); await expect(active('試験の手順')).toHaveCount(0);
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toContain('閉じる前の追記');
+  await page.keyboard.press('Control+Shift+t'); await expect(editor).toContainText('閉じる前の追記'); await expect(editor).toBeFocused();
+  await page.keyboard.press('Control+1'); await page.keyboard.press('Control+w'); await expect(active('耐久性評価')).toHaveCount(0);
+});
+
+test('Ctrl+Wの保存失敗でタブを残し、右の最後のタブは閉じるとペインを畳む', async ({ page }) => {
+  await connectTestVault(page); await page.getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.getByRole('button', { name: '左右分割を切り替え', exact: true }).click();
+  const right = page.getByRole('region', { name: '右ペイン', exact: true }), editor = right.getByRole('textbox', { name: '試験の手順の本文', exact: true });
+  await editor.click(); await editor.press('Control+End'); await page.keyboard.insertText('保存が必要な追記');
+  await page.evaluate(() => { window.__laminaFixture.failure = true; }); await editor.press('Control+w');
+  await expect(page.getByRole('alert')).toContainText('保存できません'); await expect(right).toBeVisible();
+  await expect(right.getByRole('tab', { name: '試験の手順', exact: true })).toBeVisible();
+  await page.evaluate(() => { window.__laminaFixture.failure = false; }); await editor.press('Control+w'); await expect(right).toHaveCount(0);
+  await expect(page.getByRole('textbox', { name: '試験の手順の本文', exact: true })).toBeFocused();
+  await page.keyboard.press('Control+Shift+t'); await expect(right).toBeVisible();
+});
+
+test('Ctrl+Nでメモを作成し、モーダル内のタブショートカットを本文へ通さない', async ({ page }) => {
+  await connectTestVault(page); await page.getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.keyboard.press('Control+n'); const dialog = page.getByRole('dialog', { name: '新しいメモ', exact: true }); await expect(dialog).toBeVisible();
+  await page.keyboard.press('Control+w'); await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toBeVisible();
+  await dialog.getByRole('textbox', { name: 'タイトル', exact: true }).fill('ショートカットで作成');
+  await dialog.getByRole('button', { name: '作成', exact: true }).click(); await expect(dialog).not.toBeVisible();
+  await expect(page.getByRole('textbox', { name: 'ショートカットで作成の本文', exact: true })).toBeFocused();
+});
+
+test('メモ削除はキャンセルでき、追記を退避して左右のタブを閉じ、参照リンクを残す', async ({ page }) => {
+  await connectTestVault(page);
+  await page.evaluate(() => { window.__laminaFixture.files['メモ/参照元.md'] = { content: '[[試験の手順]]', revision: 'ref' }; });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.getByRole('button', { name: '左右分割を切り替え', exact: true }).click();
+  const editor = page.getByRole('region', { name: '右ペイン', exact: true }).getByRole('textbox', { name: '試験の手順の本文', exact: true });
+  await editor.press('Control+End'); await page.keyboard.insertText('退避する追記');
+  const requestDelete = async () => { await page.getByLabel('メモ/試験の手順.mdの操作', { exact: true }).first().click(); await page.getByRole('menuitem', { name: 'メモを削除', exact: true }).click(); };
+  await requestDelete(); const dialog = page.getByRole('dialog', { name: 'メモを削除', exact: true });
+  await expect(dialog).toContainText('参照が1件'); await dialog.getByRole('button', { name: 'キャンセル', exact: true }).click();
+  await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toHaveCount(2);
+  await requestDelete(); await dialog.getByRole('button', { name: '削除する', exact: true }).click(); await expect(dialog).not.toBeVisible();
+  await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toHaveCount(0); await expect(page.getByRole('region', { name: '右ペイン', exact: true })).toHaveCount(0);
+  const disk = await page.evaluate(() => ({ files: window.__laminaFixture.files, trash: window.__laminaFixture.trash }));
+  expect(disk.files['メモ/試験の手順.md']).toBeUndefined(); expect(disk.trash?.['メモ/試験の手順.md'].content).toContain('退避する追記'); expect(disk.files['メモ/参照元.md'].content).toBe('[[試験の手順]]');
+  await page.keyboard.press('Control+Shift+t'); await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toHaveCount(0);
+  await page.reload(); await expect(page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true })).toHaveCount(0);
+});
+
+for (const failure of ['保存失敗', '外部変更'] as const) test(`メモ削除の${failure}では元のファイルとタブを残す`, async ({ page }) => {
+  await connectTestVault(page); await page.getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.evaluate(failure => {
+    if (failure === '保存失敗') window.__laminaFixture.trashFailure = true;
+    else window.__laminaFixture.files['メモ/試験の手順.md'] = { content: '外部で変更した本文', revision: 'external' };
+  }, failure);
+  await page.getByLabel('メモ/試験の手順.mdの操作', { exact: true }).first().click(); await page.getByRole('menuitem', { name: 'メモを削除', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'メモを削除', exact: true }); await dialog.getByRole('button', { name: '削除する', exact: true }).click();
+  await expect(dialog).toBeVisible(); await expect(page.getByRole('alert')).toContainText(failure === '保存失敗' ? '削除のテスト用失敗' : '外部で変更');
+  await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'])).toBeDefined();
+  expect(await page.evaluate(() => window.__laminaFixture.trash)).toBeUndefined();
+});
+
+test('メモを退避した後の画面状態保存失敗は、削除を繰り返さず知らせる', async ({ page }) => {
+  await connectTestVault(page); await page.getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.evaluate(() => { window.__laminaFixture.sessionFailure = true; });
+  await page.getByLabel('メモ/試験の手順.mdの操作', { exact: true }).first().click(); await page.getByRole('menuitem', { name: 'メモを削除', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'メモを削除', exact: true }); await dialog.getByRole('button', { name: '削除する', exact: true }).click();
+  await expect(dialog).not.toBeVisible(); await expect(page.getByRole('alert')).toContainText('workspace.json');
+  await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toHaveCount(0);
+  expect(await page.evaluate(() => window.__laminaFixture.trash?.['メモ/試験の手順.md'])).toBeDefined();
+});
+
+for (const fail of [false, true]) test(`資料セルの編集中にCtrl+Wを押すと確定を待ち、保存${fail ? '失敗ならタブを保持' : '成功後に閉じる'}`, async ({ page }) => {
+  await connectTestVault(page); await seedMaterials(page); await page.getByRole('button', { name: '資料一覧', exact: true }).click();
+  const input = page.getByRole('textbox', { name: '評価.xlsxのメモ', exact: true });
+  await input.fill('閉じる前に確定するメモ');
+  if (fail) await page.evaluate(() => { window.__laminaFixture.operationFailure = true; });
+  await input.press('Control+w');
+  if (fail) {
+    await expect(page.getByRole('alert')).toContainText('保存失敗');
+    await expect(page.getByRole('tab', { name: '資料一覧', exact: true })).toBeVisible(); await expect(input).toHaveValue('閉じる前に確定するメモ');
+    await input.fill('失敗後にもう一度編集'); await input.press('Control+w');
+    await expect(page.getByRole('tab', { name: '資料一覧', exact: true })).toBeVisible(); await expect(input).toHaveValue('失敗後にもう一度編集');
+  } else {
+    await expect(page.getByRole('tab', { name: '資料一覧', exact: true })).toHaveCount(0);
+    expect(await page.evaluate(() => window.__laminaFixture.files['資料/評価.xlsx.md'].content)).toContain('閉じる前に確定するメモ');
+  }
 });
 
 test('ピン留め・左右分割と同じ文書の同期を維持する', async ({ page }) => {
@@ -389,6 +507,235 @@ for (const count of [1, 4]) test(`テーマの${count}か月表示で月ラベ�
   }
   await editor.press('Control+s');
   for (const month of months) expect(await page.evaluate(path => window.__laminaFixture.files[path].content, month.path)).toBe(month.content);
+});
+
+for (const [shortcut, marker] of [['Control+b', '**'], ['Control+i', '*'], ['Control+e', '`'], ['Control+Shift+x', '~~']]) test(`${shortcut}で書式を適用・解除し、Undo・保存できる`, async ({ page }) => {
+  const editor = await openMarkdown(page, '対象');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await editor.press('Control+a'); await editor.press(shortcut); await editor.press('Control+s');
+  await expect.poll(saved).toBe(`${marker}対象${marker}`);
+  await editor.press(shortcut); await editor.press('Control+s'); await expect.poll(saved).toBe('対象');
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(`${marker}対象${marker}`);
+  await editor.press('Control+Shift+z'); await editor.press('Control+s'); await expect.poll(saved).toBe('対象');
+});
+
+test('未選択のCtrl+Bは記法の内側に入力し、コード・YAMLを変更しない', async ({ page }) => {
+  const editor = await openMarkdown(page, '本文\n\n');
+  await editor.press('Control+End'); await editor.press('Control+b'); await page.keyboard.insertText('追記'); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('本文\n\n**追記**');
+  await editor.press('Control+b'); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('本文\n\n追記');
+});
+
+test('Ctrl+Kでリンク先を編集し、URL貼り付けを資料登録へ渡さない', async ({ page }) => {
+  const editor = await openMarkdown(page, '仕様書');
+  await editor.press('Control+a'); await editor.press('Control+k');
+  await editor.evaluate(element => {
+    const transfer = new DataTransfer(); transfer.setData('text/plain', 'https://example.com/spec');
+    element.dispatchEvent(new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true }));
+  });
+  await expect(page.getByRole('dialog')).toHaveCount(0); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('[仕様書](https://example.com/spec)');
+  await editor.press('Home'); await editor.press('ArrowRight'); await editor.press('Control+k');
+  expect(await page.evaluate(() => window.getSelection()?.toString())).toBe('https://example.com/spec');
+});
+
+test('見出し・引用・番号・箇条書きのショートカットで階層とキャレットを保つ', async ({ page }) => {
+  const editor = await openMarkdown(page, '一\n二');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await editor.press('Control+a'); await editor.press('Control+Shift+Digit8'); await editor.press('Control+s'); await expect.poll(saved).toBe('- 一\n- 二');
+  await editor.press('Control+Shift+Digit7'); await editor.press('Control+s'); await expect.poll(saved).toBe('1. 一\n2. 二');
+  await editor.press('Control+Shift+Period'); await editor.press('Control+s'); await expect.poll(saved).toBe('> 1. 一\n> 2. 二');
+  await editor.press('Control+Shift+Period'); await editor.press('Control+Shift+Digit7');
+  await editor.press('Control+Home'); await editor.press('Control+Alt+2'); await editor.press('Control+s'); await expect.poll(saved).toBe('## 一\n二');
+  await editor.press('Control+Alt+0'); await editor.press('Control+s'); await expect.poll(saved).toBe('一\n二');
+});
+
+test('取り消し線・水平線を整形表示し、元のMarkdownを保持する', async ({ page }) => {
+  const content = '最初\n\n~~廃止~~ と **太字** と *斜体*\n\n---\n\n最後';
+  const editor = await openMarkdown(page, content);
+  await expect(editor.locator('.cm-preview-strike')).toHaveText('廃止');
+  await expect(editor.locator('.cm-preview-rule')).toHaveCount(1);
+  await expect(editor.locator('.cm-preview-strong')).toHaveText('太字');
+  await expect(editor.locator('.cm-preview-emphasis')).toHaveText('斜体');
+  await editor.press('Control+s'); expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(content);
+});
+
+test('Ctrl+Shift+Cでコードブロックを作成・解除し、その中では太字を挿入しない', async ({ page }) => {
+  const editor = await openMarkdown(page, 'const n = 1;');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await editor.press('Control+a'); await editor.press('Control+Shift+c'); await editor.press('Control+s');
+  await expect.poll(saved).toBe('```\nconst n = 1;\n```');
+  await editor.press('Control+b'); await editor.press('Control+s'); await expect.poll(saved).toBe('```\nconst n = 1;\n```');
+  await editor.press('Control+Shift+c'); await editor.press('Control+s'); await expect.poll(saved).toBe('const n = 1;');
+});
+
+test('月次ノートの見出しとタスクをまとめて装飾し、ファイル境界とUndoを保つ', async ({ page }) => {
+  await connectTestVault(page);
+  const old = '# 2026-10-31\n\n- [ ] 先月', recent = '# 2026-11-01\n\n- 今月';
+  await page.evaluate(({ old, recent }) => { window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'].content = old; window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content = recent; }, { old, recent });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  await editor.press('Control+a'); await editor.press('Control+b'); await editor.press('Control+s');
+  const saved = () => page.evaluate(() => ['2026-10', '2026-11'].map(month => window.__laminaFixture.files[`テーマ/耐久性評価/${month}.md`].content));
+  await expect.poll(saved).toEqual(['# **2026-10-31**\n\n- [ ] **先月**', '# **2026-11-01**\n\n- **今月**']);
+  await expect(editor.locator('.month-divider')).toHaveCount(2);
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toEqual([old, recent]);
+});
+
+test('タスクをチェックボックスで描画し、クリック・Ctrl+L・UndoでもMarkdownを保つ', async ({ page }) => {
+  const content = '# タスク\n- [ ] 未完了\n- [x] 完了\n    - [ ] 子項目\n\n通常の本文';
+  const editor = await openMarkdown(page, content);
+  await expect(editor.getByRole('checkbox')).toHaveCount(3);
+  await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).not.toBeChecked();
+  await expect(editor.getByRole('checkbox', { name: '完了', exact: true })).toBeChecked();
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await editor.getByRole('checkbox', { name: '未完了', exact: true }).click();
+  await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).toBeChecked();
+  await editor.press('Control+s'); await expect.poll(saved).toBe(content.replace('- [ ] 未完了', '- [x] 未完了'));
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(content);
+  await editor.locator('.cm-line').filter({ hasText: /^- \[ \] 未完了$/ }).click(); await editor.press('End'); await editor.press('Control+l');
+  await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).toBeChecked();
+  await editor.press('Control+l'); await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).not.toBeChecked();
+  await editor.press('Control+End'); await editor.press('Control+l');
+  await expect(editor.getByRole('checkbox', { name: '通常の本文', exact: true })).not.toBeChecked();
+  await expect(editor).toBeFocused(); await editor.press('End'); await editor.press('Enter');
+  await page.keyboard.insertText('続きのタスク');
+  await expect(editor.getByRole('checkbox', { name: '続きのタスク', exact: true })).not.toBeChecked();
+  await editor.press('Control+l'); await editor.press('Control+s');
+  await expect.poll(saved).toBe(content.replace('通常の本文', '- [ ] 通常の本文\n- [x] 続きのタスク'));
+  await page.screenshot({ path: '.tools/qa/task-checkboxes.png' });
+});
+
+test('チェック項目を含む月次ページで上下・クリック位置がずれず前月のコードに影響されない', async ({ page }) => {
+  await connectTestVault(page);
+  const old = '# 2026-10-31\n```md\n- [ ] コード';
+  const recent = '# 2026-11-01\n\n' + Array.from({ length: 12 }, (_, i) => `${i % 3 === 1 ? '    ' : ''}- [${i % 2 ? 'x' : ' '}] 確認 ${i + 1}`).join('\n');
+  await page.evaluate(({ old, recent }) => {
+    window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'].content = old;
+    window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content = recent;
+  }, { old, recent });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click();
+  await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  const currentLine = () => editor.evaluate(() => {
+    const anchor = window.getSelection()?.anchorNode;
+    return (anchor instanceof Element ? anchor : anchor?.parentElement)?.closest('.cm-line')?.textContent;
+  });
+  const lines = [...old.split('\n'), ...recent.split('\n')];
+  await editor.press('Control+End');
+  for (let i = lines.length - 2; i >= 0; i--) { await editor.press('ArrowUp'); await expect.poll(currentLine).toBe(lines[i]); }
+  for (let i = 1; i < lines.length; i++) { await editor.press('ArrowDown'); await expect.poll(currentLine).toBe(lines[i]); }
+  await editor.locator('.cm-line').filter({ hasText: '確認 12' }).click(); await editor.press('Home');
+  expect((await caretPosition(editor)).offset).toBe(6);
+  await editor.press('Control+l');
+  await expect(editor.getByRole('checkbox', { name: '確認 12', exact: true })).not.toBeChecked();
+  await editor.getByRole('checkbox', { name: '確認 12', exact: true }).click();
+  await expect(editor.getByRole('checkbox', { name: '確認 12', exact: true })).toBeChecked();
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'].content)).toBe(old);
+  expect(await page.evaluate(() => window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content)).toBe(recent);
+});
+
+test('Ctrl+Lで複数行をタスクにし、コード・YAML・見出しと区切りの空行を保持する', async ({ page }) => {
+  const content = '---\ntitle: 記録\n---\n# タスク\n\n普通の項目\n- 箇条書き\n- [x] 完了\n\n```md\n- [ ] コード\n```';
+  const editor = await openMarkdown(page, content);
+  await editor.press('Control+a'); await editor.press('Control+l'); await editor.press('Control+s');
+  const converted = content.replace('普通の項目', '- [ ] 普通の項目').replace('- 箇条書き', '- [ ] 箇条書き');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await expect.poll(saved).toBe(converted); await expect(editor.getByRole('checkbox')).toHaveCount(3);
+  await editor.press('Control+l'); await editor.press('Control+s');
+  await expect.poll(saved).toBe(converted.replace('- [ ] 普通の項目', '- [x] 普通の項目').replace('- [ ] 箇条書き', '- [x] 箇条書き'));
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(converted);
+});
+
+test('長い月次ノート末尾でも繰り返しEnter・Tab・Delete・Undoが動く', async ({ page }) => {
+  await connectTestVault(page);
+  const prefix = '# 2026-11-01\n\n' + '試験条件と結果の記録。\n\n'.repeat(400);
+  await page.evaluate(content => { window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content = content; }, prefix + '- 前\n- 子');
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click();
+  await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  await editor.press('Control+End'); await editor.press('Tab'); await editor.press('Enter');
+  await page.keyboard.insertText('孫候補'); await editor.press('Tab'); await editor.press('Enter');
+  await page.keyboard.insertText('次'); await editor.press('Control+s');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content);
+  await expect.poll(saved).toBe(prefix + '- 前\n    - 子\n        - 孫候補\n        - 次');
+  await editor.press('ArrowUp'); await editor.press('End'); await editor.press('Delete'); await editor.press('Control+s');
+  await expect.poll(saved).toBe(prefix + '- 前\n    - 子\n        - 孫候補次');
+  await editor.press('Control+z'); await editor.press('Control+s');
+  await expect.poll(saved).toBe(prefix + '- 前\n    - 子\n        - 孫候補\n        - 次');
+  expect(await page.evaluate(() => window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'].content)).toBe('# 2026-10-31\n\n初回の試験を完了した。\n');
+});
+
+test('Alt上下で子孫ごと項目を並べ替え、Undo後も続けて入力できる', async ({ page }) => {
+  const original = '# 記録\n- 前\n- 親\n    - 子\n        - 孫\n- 後';
+  const editor = await openMarkdown(page, original);
+  await editor.locator('.cm-line').filter({ hasText: /^- 親$/ }).click(); await editor.press('End');
+  await editor.press('Alt+ArrowDown'); await editor.press('Control+s');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await expect.poll(saved).toBe('# 記録\n- 前\n- 後\n- 親\n    - 子\n        - 孫');
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(original);
+  await editor.press('Alt+ArrowUp'); await editor.press('Enter'); await page.keyboard.insertText('追記'); await editor.press('Control+s');
+  await expect.poll(saved).toBe('# 記録\n- 親\n- 追記\n    - 子\n        - 孫\n- 前\n- 後');
+});
+
+test('見出しの開閉・入れ子・目次ジャンプで本文を保持する', async ({ page }) => {
+  const content = '# 一日目\n\n本文 A\n## 条件\n条件の本文\n### 補足\n補足の本文\n## 結果\n結果の本文\n# 二日目\n本文 B';
+  const editor = await openMarkdown(page, content);
+  await editor.getByRole('button', { name: '条件を折り畳む', exact: true }).click();
+  await expect(editor.locator('.cm-line').filter({ hasText: '条件の本文' })).toHaveCount(0);
+  await expect(editor.locator('.cm-line').filter({ hasText: '結果の本文' })).toBeVisible();
+  await editor.getByRole('button', { name: '一日目を折り畳む', exact: true }).click();
+  await expect(editor.locator('.cm-line').filter({ hasText: '本文 A' })).toHaveCount(0);
+  await expect(editor.locator('.cm-line').filter({ hasText: '本文 B' })).toBeVisible();
+  await editor.getByRole('button', { name: '一日目を展開', exact: true }).click();
+  await expect(editor.getByRole('button', { name: '条件を展開', exact: true })).toBeVisible();
+  await page.getByRole('tab', { name: '目次', exact: true }).click();
+  await page.getByRole('navigation', { name: '本文の目次', exact: true }).getByRole('button', { name: '補足', exact: true }).click();
+  await expect(editor.locator('.cm-line').filter({ hasText: '補足の本文' })).toBeVisible();
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(content);
+});
+
+test('キーボードで見出しを個別・一括開閉し、展開直後にも入力できる', async ({ page }) => {
+  const content = '# 第一\n本文 A\n## 条件\n条件の本文\n# 第二\n本文 B';
+  const editor = await openMarkdown(page, content);
+  await editor.press('Control+Home'); await editor.press('Control+Shift+BracketLeft');
+  await expect(editor.getByRole('button', { name: '第一を展開', exact: true })).toBeVisible();
+  await editor.press('Control+Shift+BracketRight');
+  await expect(editor.getByRole('button', { name: '第一を折り畳む', exact: true })).toBeVisible();
+  await editor.press('Control+Alt+[');
+  await expect(editor.locator('.cm-line').filter({ hasText: '本文 A' })).toHaveCount(0);
+  await expect(editor.locator('.cm-line').filter({ hasText: '本文 B' })).toHaveCount(0);
+  await editor.press('Control+Alt+]');
+  await expect(editor.locator('.cm-line').filter({ hasText: '本文 B' })).toBeVisible();
+  await editor.press('Control+End'); await page.keyboard.insertText('追記'); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(content + '追記');
+  await page.screenshot({ path: '.tools/qa/headings-folding.png' });
+});
+
+test('テーマの折り畳みは月境界を越えず、タブ・再起動後も復元する', async ({ page }) => {
+  await connectTestVault(page);
+  await page.getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  await editor.getByRole('button', { name: '2026-10-31を折り畳む', exact: true }).click();
+  await expect(editor.locator('.cm-line').filter({ hasText: '初回の試験' })).toHaveCount(0);
+  await expect(editor.getByRole('button', { name: '2026-11-11を折り畳む', exact: true })).toBeVisible();
+  await expect(editor.locator('.month-divider')).toHaveCount(2);
+  await page.getByRole('button', { name: 'ピン留め', exact: true }).click();
+  await page.getByRole('button', { name: '試験の手順', exact: true }).click();
+  await page.getByRole('tab', { name: '耐久性評価', exact: true }).click();
+  await expect(editor.getByRole('button', { name: '2026-10-31を展開', exact: true })).toBeVisible();
+  await page.evaluate(() => window.__laminaClose());
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem('lamina.test.workspace') ?? '{}').panes?.[0]?.tabs?.[0]?.view?.folds?.length)).toBe(1);
+  await page.reload();
+  await expect(editor.getByRole('button', { name: '2026-10-31を展開', exact: true })).toBeVisible();
+  await editor.getByRole('button', { name: '2026-10-31を展開', exact: true }).click();
+  await expect(editor.locator('.cm-line').filter({ hasText: '初回の試験' })).toBeVisible();
 });
 
 test('箇条書きの上下移動で行や文字位置を飛ばさず、折り返しでも往復できる', async ({ page }) => {
@@ -686,7 +1033,8 @@ test('資料：引用符付きパスを登録し、通常リンク・種類ア�
   const disk = await page.evaluate(() => window.__laminaFixture.files);
   expect(disk['メモ/試験の手順.md'].content).toContain('[結果 #1.xlsx](file:///C:/'); expect(disk['メモ/試験の手順.md'].content).toContain('%231.xlsx');
   expect(disk['資料/結果 #1.xlsx.md'].content).toContain("added: '2026-11-12'"); expect(disk['資料/結果 #1.xlsx.md'].content).not.toMatch(/\bid:/);
-  await page.getByRole('button', { name: '結果 #1.xlsxの資料プロパティ', exact: true }).click();
+  await page.getByRole('button', { name: '結果 #1.xlsxの資料詳細', exact: true }).click();
+  await page.getByRole('complementary', { name: '資料の詳細', exact: true }).getByRole('button', { name: 'プロパティ', exact: true }).click();
   const properties = page.getByRole('dialog', { name: '資料のプロパティ', exact: true }); await properties.getByRole('combobox', { name: '資料の種類' }).selectOption('pdf'); await properties.getByRole('button', { name: '変更を保存', exact: true }).click(); await expect(properties).not.toBeVisible();
   await editor.press('Control+Home'); await expect(link.locator('svg')).toHaveClass(/type-pdf/);
   // Reopen after property edits, then verify one insertion is one undo step.
@@ -694,6 +1042,30 @@ test('資料：引用符付きパスを登録し、通常リンク・種類ア�
   await expect.poll(() => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('資料を確認する。\n\n');
   expect(await page.evaluate(() => Object.keys(window.__laminaFixture.files).filter(path => path.startsWith('資料/')))).toHaveLength(1);
   await editor.press('Control+Shift+z'); await editor.press('Control+s'); await editor.press('Control+Home'); await expect(link).toBeVisible();
+});
+
+test('本文の資料情報は右に詳細を開き、メモ・参照元・プロパティ編集を一覧と共通にする', async ({ page }) => {
+  const editor = await openMarkdown(page, '# 記録\n\n[評価表](file:///C:/試験/評価.xlsx)\n\n末尾');
+  await seedMaterials(page);
+  await page.getByRole('button', { name: '右サイドバーを切り替え', exact: true }).click();
+  await page.getByRole('button', { name: '評価表の資料詳細', exact: true }).click();
+  const detail = page.getByRole('complementary', { name: '資料の詳細', exact: true });
+  await expect(detail).toBeVisible(); await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(detail.getByRole('heading', { name: '評価.xlsx', exact: true })).toBeVisible();
+  await expect(detail).toContainText('荷重と温度の比較。'); await expect(detail).toContainText('耐久性評価');
+  await expect(detail.getByRole('button').filter({ hasText: '試験の手順' })).toContainText('評価表');
+  await expect(editor).toBeVisible(); await expect(page.getByRole('tab', { name: '試験の手順', exact: true })).toHaveAttribute('aria-selected', 'true');
+  await detail.getByRole('button', { name: '資料を開く', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__laminaFixture.openedUrls)).toContain('C:\\試験\\評価.xlsx');
+  await detail.getByRole('button', { name: 'プロパティ', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '資料のプロパティ', exact: true });
+  await dialog.getByRole('textbox', { name: '資料のメモ', exact: true }).fill('変更したメモ。\n二行目。');
+  await dialog.getByRole('button', { name: '変更を保存', exact: true }).click(); await expect(dialog).not.toBeVisible();
+  await expect(detail).toContainText('変更したメモ。'); await expect(detail).toContainText('二行目。');
+  await page.screenshot({ path: '.tools/qa/inline-material-detail.png' });
+  await detail.getByRole('button', { name: '資料の詳細を閉じる', exact: true }).click(); await expect(detail).toHaveCount(0); await expect(editor).toBeFocused();
+  await page.getByRole('button', { name: '資料一覧', exact: true }).click(); await page.getByRole('button', { name: '評価.xlsxの詳細', exact: true }).click();
+  await expect(detail).toContainText('変更したメモ。'); await expect(detail).toContainText('二行目。');
 });
 
 test('資料：SharePointのURLとファイル名情報を保ち、登録済み資料とテーマを再利用する', async ({ page }) => {
@@ -734,7 +1106,8 @@ test('資料：パス修正で参照リンクだけを一括更新し、表示�
   const editor = await openMarkdown(page, `[独自のラベル](${old})\n\n本文 ${old}\n\n\`[コード](${old})\`\n`);
   await page.evaluate(content => { window.__laminaFixture.files['資料/例.md'] = { content, revision: 'resource' }; }, writeMaterial({ ...materialDraft(old), title: '参考ページ', added: '2026-11-01' }));
   await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', ''); await editor.press('Control+End');
-  await page.getByRole('button', { name: '独自のラベルの資料プロパティ', exact: true }).click();
+  await page.getByRole('button', { name: '独自のラベルの資料詳細', exact: true }).click();
+  await page.getByRole('complementary', { name: '資料の詳細', exact: true }).getByRole('button', { name: 'プロパティ', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '資料のプロパティ', exact: true }); await dialog.getByRole('textbox', { name: '資料のパス・URL' }).fill(next); await expect(dialog).toContainText('1か所・1ファイル'); await dialog.getByRole('button', { name: '変更を保存', exact: true }).click(); await expect(dialog).not.toBeVisible();
   const content = await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content); expect(content).toContain(`[独自のラベル](${next})`); expect(content).toContain(`本文 ${old}`); expect(content).toContain(`\`[コード](${old})\``);
 });

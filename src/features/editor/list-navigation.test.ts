@@ -12,7 +12,7 @@ describe('リストのキャレット位置', () => {
   it('実際のリストだけで記号と字下げを判定し、コードの同じ文字列を除く', () => {
     const text = '- 親\n    - 子\n    1. 番号\n\n```md\n- コード\n```\n\n    - インデントコード';
     expect(listPrefixes(text).map(prefix => text.slice(prefix.from, prefix.to))).toEqual(['- ', '    - ', '    1. ']);
-    expect(listPrefixes('- [ ] タスク')[0].to).toBe(2);
+    expect(listPrefixes('- [ ] タスク')[0].to).toBe(6);
   });
   it('Home・左右・マウスなどの単一キャレットを本文先頭へ寄せる', () => {
     const original = state('- 親\n    - 子');

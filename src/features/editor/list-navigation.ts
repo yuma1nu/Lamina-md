@@ -3,6 +3,7 @@ import { commonmarkLanguage } from '@codemirror/lang-markdown';
 import type { Command } from '@codemirror/view';
 import { compose } from '../../domain/documents';
 import { sourceFilesEffect, sourceFilesField } from './source-model';
+import { taskMarker } from './task-list';
 
 export interface ListPrefix { from: number; to: number }
 const prefixCache = new Map<string, { text: string; prefixes: ListPrefix[] }>();
@@ -13,7 +14,7 @@ export function listPrefixes(text: string): ListPrefix[] {
     if (node.name !== 'ListMark') return;
     const line = state.doc.lineAt(node.from);
     const whitespace = /^[ \t]*/.exec(line.text.slice(node.to - line.from))![0];
-    prefixes.push({ from: line.from, to: node.to + whitespace.length });
+    prefixes.push({ from: line.from, to: taskMarker(text, node.to)?.bodyFrom ?? node.to + whitespace.length });
   } });
   return prefixes;
 }

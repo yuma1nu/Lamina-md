@@ -17,6 +17,7 @@ export interface DesktopApi {
   openResource(path: string): Promise<void>;
   readCatalog(): Promise<Catalog>;
   applyOperation(operation: Operation): Promise<Catalog>;
+  trashNote(path: string, revision: string): Promise<Catalog>;
   watchVault(): Promise<void>;
 }
 export const desktop: DesktopApi = {
@@ -31,6 +32,7 @@ export const desktop: DesktopApi = {
   openResource: path => invoke('open_resource', { path }),
   readCatalog: () => invoke('read_catalog'),
   applyOperation: operation => invoke('apply_operation', { operation }),
+  trashNote: (path, revision) => invoke('trash_note', { path, expectedRevision: revision }),
   watchVault: () => invoke('watch_vault'),
 };
 export async function chooseVault(): Promise<string | null> {

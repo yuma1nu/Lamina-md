@@ -2,12 +2,12 @@ import { Transaction } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { compose } from '../../domain/documents';
-import { isMarkupPosition } from '../../domain/note-links';
+import { isMarkupPosition, noteReferences } from '../../domain/note-links';
 import { location, readMaterial, type MaterialInsertion } from '../../domain/materials';
 import { workspace, useWorkspace } from '../../app/workspace';
 import { sourceFilesField } from '../editor/source-model';
 import { insertImages } from '../images/image-preview';
-import { editMaterial, materialCommitted, materialError, requestMaterial, resourceApi } from './material-service';
+import { materialCommitted, materialError, requestMaterial, resourceApi } from './material-service';
 import { isDesktop } from '../../platform/desktop';
 
 export function pasteCandidate(text: string, html = ''): { path: string; title?: string } | null {
@@ -32,6 +32,9 @@ export function materialEditor(view: () => EditorView | null, documentId: string
     if (!segment || to > segment.to) return null;
     const file = files[segment.index];
     if (isMarkupPosition(file.path, file.content, from - segment.from)) return null;
+    // Pasting a destination while editing [label](URL) should update that URL,
+    // rather than register a material and nest another link inside it.
+    if (noteReferences(file.path, file.content, true).some(ref => from - segment.from >= ref.targetFrom && to - segment.from <= ref.targetTo)) return null;
     const full = workspace.index().files.get(file.path); if (!full) return null;
     const offset = bodyOnly ? readMaterial(full).bodyFrom : 0, expectedEditor = current.state.doc.toString();
     return { documentId, pane, sourcePath: file.path, from: from - segment.from + offset, to: to - segment.from + offset, expectedContent: full.content,
@@ -67,12 +70,12 @@ export function materialEditor(view: () => EditorView | null, documentId: string
       return false;
     },
     mousedown(event) { if (event.target instanceof Element && event.target.closest('[data-material-info]')) { event.preventDefault(); return true; } return false; },
-    click(event, current) {
+    click(event) {
       const button = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-material-info]') : null;
       if (!button) return false;
       event.preventDefault();
       const material = workspace.materials().materials.find(item => item.file.path === button.dataset.materialInfo);
-      if (material) editMaterial(material, () => { if (view() === current) current.focus(); }); return true;
+      if (material) workspace.showMaterialDetail(material.file.path, pane, documentId); return true;
     },
   });
   async function nativeDrop(paths: string[], x: number, y: number) {

@@ -6,8 +6,9 @@ import { chooseVault, isDesktop } from '../platform/desktop';
 import { useWorkspace, workspace } from './workspace';
 import { FolderButton, Inspector, ItemActions, NoteTree, WorkspaceDialog, WorkspaceTools, openMode, type EditRequest } from './WorkspaceTools';
 import { imagesChanged } from '../features/images/image-service';
-import { MaterialsView, MaterialPage } from '../features/materials/MaterialsView';
+import { MaterialsView, MaterialPage, MaterialDetail } from '../features/materials/MaterialsView';
 import { MaterialDialog } from '../features/materials/MaterialDialog';
+import { focusActiveEditor, tabShortcut } from './tab-shortcuts';
 
 const MarkdownEditor = lazy(() => import('../features/editor/MarkdownEditor').then(module => ({ default: module.MarkdownEditor })));
 
@@ -20,6 +21,8 @@ export function App() {
   const modal = useRef<HTMLDialogElement>(null);
   const choosingVault = useRef(false);
   const activeId = state.panes[state.activePane].active, active = activeId ? state.documents[activeId] : null;
+  const detailRequest = state.materialDetail;
+  const detail = detailRequest && detailRequest.pane === state.activePane && detailRequest.documentId === activeId ? workspace.materials().materials.find(item => item.file.path === detailRequest.path) : null;
   const recent = localStorage.getItem('lamina.lastVault');
   async function selectVault(initialize: boolean) {
     choosingVault.current = true;
@@ -42,6 +45,8 @@ export function App() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); void workspace.flush().catch(() => {}); }
     }
     window.addEventListener('keydown', keyboard);
+    const tabs = (event: KeyboardEvent) => { void tabShortcut(event, () => { setName(''); setCreation('note'); }); };
+    window.addEventListener('keydown', tabs, true);
     const beforeUnload = (event: BeforeUnloadEvent) => {
       if (useWorkspace.getState().annotationOpen || Object.values(useWorkspace.getState().documents).some(d => d.files.some(f => f.revision === null || f.content !== f.savedContent))) event.preventDefault();
     };
@@ -56,8 +61,9 @@ export function App() {
     }).then(stop => { if (disposed) stop(); else unlisten = stop; }).catch(error => {
       if (!disposed) useWorkspace.setState({ error: `終了処理を準備できませんでした。\n${String(error)}` });
     });
-    return () => { disposed = true; watchDisposed = true; watchStops.forEach(stop => stop()); stopSession(); clearTimeout(focusTimer); unlisten?.(); window.removeEventListener('keydown', keyboard); window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('focus', focus); };
+    return () => { disposed = true; watchDisposed = true; watchStops.forEach(stop => stop()); stopSession(); clearTimeout(focusTimer); unlisten?.(); window.removeEventListener('keydown', keyboard); window.removeEventListener('keydown', tabs, true); window.removeEventListener('beforeunload', beforeUnload); window.removeEventListener('focus', focus); };
   }, []);
+  useEffect(() => { focusActiveEditor(); }, [state.activePane, state.panes[0].active, state.panes[1].active]);
   useEffect(() => {
     if (creation && !modal.current?.open) modal.current?.showModal();
     if (!creation && modal.current?.open) modal.current?.close();
@@ -73,7 +79,7 @@ export function App() {
   function beginCreate(kind: 'theme' | 'note') { setName(''); setCreation(kind); }
   const filteredThemes = state.vault?.themes.filter(t => t.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [];
   const filteredNotes = state.vault?.notes.filter(n => n.path.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [];
-  return <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'} ${state.outline && active && active.kind !== 'materials' ? '' : 'outline-hidden'}`} inert={state.busy || state.closing} aria-busy={state.busy || state.closing}>
+  return <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'} ${state.outline && active && active.kind !== 'materials' ? '' : 'outline-hidden'} ${state.outline && detail ? 'material-inspector' : ''}`} inert={state.busy || state.closing} aria-busy={state.busy || state.closing}>
     {sidebar && <aside className="sidebar">
       <div className="brand"><Layers size={21} strokeWidth={1.6} /><span>Lamina<span className="brand-suffix">.md</span></span></div>
       {state.vault ? <>
@@ -106,7 +112,7 @@ export function App() {
         })}
       </div>
     </main>
-    {state.outline && active && active.kind !== 'materials' && <Inspector document={active} />}
+    {state.outline && active && active.kind !== 'materials' && (detail ? <MaterialDetail material={detail} pane={state.activePane} className="material-inspector-panel" close={() => { useWorkspace.setState({ materialDetail: null }); focusActiveEditor(); }} /> : <Inspector document={active} />)}
     <MaterialDialog />
     <WorkspaceDialog request={editRequest} close={() => setEditRequest(null)} />
     {state.error && <div className="error-message" role="alert"><AlertCircle size={18} /><div><strong>操作を完了できませんでした</strong><p>{state.error}</p></div>{state.vault && <button className="icon-button" aria-label="保存を再試行" title="保存を再試行" onClick={() => void workspace.flush().catch(() => {})}><RotateCw size={17} /></button>}<button className="icon-button" aria-label="通知を閉じる" onClick={() => useWorkspace.setState({ error: null })}><X size={17} /></button></div>}

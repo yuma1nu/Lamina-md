@@ -3,13 +3,16 @@ import { ChangeSet, Compartment, EditorState, StateField, Transaction } from '@c
 import { Decoration, EditorView, WidgetType, drawSelection, keymap, type DecorationSet } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory, redo } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
-import { indentUnit } from '@codemirror/language';
+import { foldEffect, foldedRanges, indentUnit, unfoldEffect } from '@codemirror/language';
 import { compose, projectChanges, type OpenDocument, type Segment } from '../../domain/documents';
 import { useWorkspace, workspace } from '../../app/workspace';
 import { documentPosition, filePosition } from '../../domain/session';
 import { changesOf, sourceFilesEffect, sourceFilesField } from './source-model';
 import { livePreview, noteIndexEffect, noteIndexField, previewLinkEvents } from './live-preview';
-import { markdownBackspace, markdownEnter, markdownListDedent, markdownListIndent, markdownSoftBreak } from './markdown-commands';
+import { markdownBackspace, markdownDelete, markdownEnter, markdownListDedent, markdownListIndent, markdownListMoveUp, markdownListMoveDown, markdownSoftBreak } from './markdown-commands';
+import { headingFoldField, headingFolding } from './heading-folding';
+import { markdownTaskToggle } from './task-list';
+import { markdownFormatting } from './formatting';
 import { noteCompletion } from './note-completion';
 import { imageExtensions, refreshImagePreview, type ImageEditRequest } from '../images/image-preview';
 
@@ -57,7 +60,9 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
       if (restoring) return;
       const files = bodyOnly ? latest.current.files : useWorkspace.getState().documents[current.id]?.files ?? latest.current.files;
       const { anchor, head } = view.state.selection.main;
-      workspace.captureView(pane, current.id, { anchor: filePosition(files, anchor), head: filePosition(files, head), scrollTop: view.scrollDOM.scrollTop });
+      const folds: NonNullable<import('../../domain/session').EditorPosition['folds']> = [];
+      foldedRanges(view.state).between(0, view.state.doc.length, (from, to) => { folds.push({ from: filePosition(files, from), to: filePosition(files, to) }); });
+      workspace.captureView(pane, current.id, { anchor: filePosition(files, anchor), head: filePosition(files, head), scrollTop: view.scrollDOM.scrollTop, folds });
     }
     const monthly = StateField.define<DecorationSet>({
       create: () => current.kind === 'theme' ? boundaries(compose(current.files).segments) : Decoration.none,
@@ -75,16 +80,16 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
         selection: startingSelection,
         extensions: [
           editability.of([EditorState.readOnly.of(locked), EditorView.editable.of(!locked)]),
-          markdown({ addKeymap: false }), history(), drawSelection(), noteIndexField.init(() => workspace.index()), noteCompletion((target, path) => void workspace.createLinkedNote(target, path, pane, true)), keymap.of([{ key: 'ArrowLeft', run: listCursorLeft }, { key: 'Enter', run: markdownEnter }, { key: 'Shift-Enter', run: markdownSoftBreak }, { key: 'Backspace', run: markdownBackspace }, { key: 'Tab', run: markdownListIndent, shift: markdownListDedent }, { key: 'Mod-Shift-z', run: redo, preventDefault: true }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
-          indentUnit.of('    '), EditorState.tabSize.of(4),
+          markdown({ addKeymap: false }), history(), drawSelection(), noteIndexField.init(() => workspace.index()), noteCompletion((target, path) => void workspace.createLinkedNote(target, path, pane, true)), keymap.of([{ key: 'ArrowLeft', run: listCursorLeft }, { key: 'Enter', run: markdownEnter }, { key: 'Shift-Enter', run: markdownSoftBreak }, { key: 'Backspace', run: markdownBackspace }, { key: 'Delete', run: markdownDelete }, { key: 'Mod-l', run: markdownTaskToggle, preventDefault: true }, { key: 'Alt-ArrowUp', run: markdownListMoveUp, preventDefault: true }, { key: 'Alt-ArrowDown', run: markdownListMoveDown, preventDefault: true }, { key: 'Tab', run: markdownListIndent, shift: markdownListDedent }, { key: 'Mod-Shift-z', run: redo, preventDefault: true }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
+          markdownFormatting, indentUnit.of('    '), EditorState.tabSize.of(4),
           sourceFilesField.init(() => current.files),
           listPrefixField, listCaretGuard,
           materials.extensions,
           imageExtensions(useWorkspace.getState().vault!.root, setImageRequest),
-          EditorView.lineWrapping, monthly, livePreview, previewLinkEvents(url => void (/^https?:\/\//i.test(url) ? workspace.openWebLink(url) : workspace.openResource(url)), (target, path, pane, newTab, syntax) => void workspace.openInternalLink(target, path, pane, newTab, syntax), pane),
+          EditorView.lineWrapping, monthly, livePreview, headingFolding, previewLinkEvents(url => void (/^https?:\/\//i.test(url) ? workspace.openWebLink(url) : workspace.openResource(url)), (target, path, pane, newTab, syntax) => void workspace.openInternalLink(target, path, pane, newTab, syntax), pane),
           EditorView.contentAttributes.of({ 'aria-label': `${current.label}の本文`, spellcheck: 'false' }),
           EditorState.transactionExtender.of(transaction =>
-            transaction.isUserEvent('input.indent') || transaction.isUserEvent('delete.dedent') || transaction.isUserEvent('input.image') || transaction.isUserEvent('input.material')
+            transaction.isUserEvent('input.indent') || transaction.isUserEvent('delete.dedent') || transaction.isUserEvent('input.image') || transaction.isUserEvent('input.material') || transaction.isUserEvent('input.task') || transaction.isUserEvent('input.format') || transaction.isUserEvent('move.list') || transaction.isUserEvent('delete.join')
               ? { annotations: isolateHistory.of('full') } : null),
           EditorState.transactionFilter.of(transaction => {
             if (!transaction.docChanged || transaction.annotation(Transaction.addToHistory) === false || transaction.annotation(materialCommitted)) return transaction;
@@ -107,6 +112,7 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
               workspace.edit(current.id, changesOf(transaction).map(change => ({ ...change, from: change.from + offset, to: change.to + offset })));
             }
             if (update.docChanged || update.selectionSet) { restoring = false; capture(update.view); }
+            else if (!restoring && update.transactions.some(tr => tr.effects.some(effect => effect.is(foldEffect) || effect.is(unfoldEffect)))) capture(update.view);
           }),
           EditorView.domEventHandlers({ scroll: (_event, view) => { capture(view); } }),
           EditorView.theme({
@@ -122,6 +128,12 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
         ],
       }).update({ selection: startingSelection }).state,
     });
+    const restoredFolds = (saved?.folds ?? []).flatMap(fold => {
+      const from = documentPosition(current.files, fold.from), to = documentPosition(current.files, fold.to);
+      const valid = view.state.field(headingFoldField).find(range => range.from === from && range.to === to);
+      return valid && !(view.state.selection.main.head > from && view.state.selection.main.head < to) ? [foldEffect.of(valid)] : [];
+    });
+    if (restoredFolds.length) view.dispatch({ effects: restoredFolds });
     editor.current = view;
     const stopDrops = materials.listenDrops();
     const imagesChanged = () => refreshImagePreview(view);

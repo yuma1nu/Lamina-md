@@ -1,7 +1,7 @@
 import { countColumn, EditorSelection, EditorState, Transaction, type StateCommand } from '@codemirror/state';
 import { commonmarkLanguage, deleteMarkupBackward, insertNewlineContinueMarkupCommand, markdown } from '@codemirror/lang-markdown';
-import { insertNewlineAndIndent } from '@codemirror/commands';
-import { indentUnit } from '@codemirror/language';
+import { insertNewlineAndIndent, moveLineDown, moveLineUp } from '@codemirror/commands';
+import { ensureSyntaxTree, indentUnit } from '@codemirror/language';
 import { compose, type TextChange } from '../../domain/documents';
 import { sourceFilesField } from './source-model';
 
@@ -13,11 +13,16 @@ function withinSource(command: StateCommand): StateCommand {
     const files = state.field(sourceFilesField), { segments } = compose(files);
     const segment = segments.find(segment => state.selection.ranges.every(range => range.from >= segment.from && range.to <= segment.to));
     if (!segment) return false;
-    const local = EditorState.create({
+    let local = EditorState.create({
       doc: files[segment.index].content,
       selection: EditorSelection.create(state.selection.ranges.map(range => EditorSelection.range(range.anchor - segment.from, range.head - segment.from)), state.selection.mainIndex),
       extensions: [markdown({ addKeymap: false }), indentUnit.of('    '), EditorState.tabSize.of(4)],
     });
+    // Fresh states initially parse only a prefix. There is no EditorView here to
+    // finish parsing in the background, so commands at the end of long files
+    // must explicitly finish the Markdown tree before reading their context.
+    ensureSyntaxTree(local, local.doc.length, 1000);
+    local = local.update({}).state;
     return command({ state: local, dispatch: transaction => {
       const changes: TextChange[] = [];
       transaction.changes.iterChanges((from, to, _newFrom, _newTo, text) => changes.push({ from: segment.from + from, to: segment.from + to, insert: text.toString() }));
@@ -130,3 +135,60 @@ function listIndent(target: Parameters<StateCommand>[0], deeper: boolean): boole
 }
 export const markdownListIndent = withinSource(target => listIndent(target, true));
 export const markdownListDedent = withinSource(target => listIndent(target, false));
+
+// Delete joins the next item's body, not its indentation, bullet or checkbox.
+// Its children stay children of the merged item at the appropriate depth.
+export const markdownDelete = withinSource(({ state, dispatch }) => {
+  const range = state.selection.main;
+  if (state.selection.ranges.length !== 1 || !range.empty) return false;
+  if (range.head === state.doc.length) return true; // Never consume a month boundary.
+  const line = state.doc.lineAt(range.head), item = currentListItem(state);
+  if (!item || range.head !== line.to) return false;
+  const nextLine = state.doc.line(line.number + 1);
+  const nextState = state.update({ selection: { anchor: nextLine.to } }).state;
+  const next = currentListItem(nextState);
+  if (!next || next.line.number !== nextLine.number || line.text.slice(0, quotePrefix(line.text)) !== nextLine.text.slice(0, quotePrefix(nextLine.text))) return false;
+  const changes: TextChange[] = [{ from: line.to, to: nextLine.from + next.contentFrom, insert: '' }];
+  const delta = indentation(item.line.text.slice(quotePrefix(item.line.text))) - indentation(nextLine.text.slice(quotePrefix(nextLine.text)));
+  if (delta) for (let n = nextLine.number + 1, end = state.doc.lineAt(Math.max(next.node.from, next.node.to - 1)).number; n <= end; n++) {
+    const child = state.doc.line(n), prefix = quotePrefix(child.text), whitespace = /^[ \t]*/.exec(child.text.slice(prefix))![0];
+    changes.push({ from: child.from + prefix, to: child.from + prefix + whitespace.length, insert: ' '.repeat(Math.max(0, indentation(whitespace) + delta)) });
+  }
+  dispatch(state.update({ changes, selection: { anchor: line.to }, scrollIntoView: true, userEvent: 'delete.join' }));
+  return true;
+});
+
+function moveListItem(target: Parameters<StateCommand>[0], down: boolean): boolean {
+  const { state, dispatch } = target;
+  if (state.selection.ranges.length !== 1) return true;
+  const range = state.selection.main, tree = commonmarkLanguage.parser.parse(state.doc.toString());
+  const nodes: SyntaxNode[] = [];
+  tree.iterate({ enter(node) { if (node.name === 'ListItem') nodes.push(node.node); } });
+  const firstLine = state.doc.lineAt(range.from).number, end = state.doc.lineAt(range.to);
+  const lastLine = end.number - (!range.empty && range.to === end.from ? 1 : 0);
+  const selected: SyntaxNode[] = [];
+  for (let n = firstLine; n <= lastLine; n++) {
+    const item = nodes.filter(node => state.doc.lineAt(node.from).number <= n && state.doc.lineAt(Math.max(node.from, node.to - 1)).number >= n).at(-1);
+    if (item && !selected.some(node => node.from === item.from)) selected.push(item);
+  }
+  if (!selected.length) return false;
+  const roots = selected.filter(node => !selected.some(parent => parent !== node && parent.from <= node.from && parent.to >= node.to));
+  if (roots.some(node => node.parent?.from !== roots[0].parent?.from)) return true;
+  const first = roots[0], last = roots.at(-1)!, sibling = down ? last.nextSibling : first.prevSibling;
+  if (!sibling || sibling.name !== 'ListItem') return true;
+  const from = state.doc.lineAt(first.from).from, to = state.doc.lineAt(Math.max(last.from, last.to - 1)).to;
+  if (range.from < from || range.to > to + 1) return true;
+  const otherFrom = state.doc.lineAt(sibling.from).from, otherTo = state.doc.lineAt(Math.max(sibling.from, sibling.to - 1)).to;
+  const body = state.doc.sliceString(from, to), other = state.doc.sliceString(otherFrom, otherTo);
+  const gap = down ? state.doc.sliceString(to, otherFrom) : state.doc.sliceString(otherTo, from);
+  const delta = down ? otherTo - to : otherFrom - from;
+  const shift = (pos: number) => pos >= from && pos <= to ? pos + delta : pos === to + 1 && !range.empty ? Math.min(state.doc.length, to + delta + 1) : pos;
+  dispatch(state.update({
+    changes: { from: Math.min(from, otherFrom), to: Math.max(to, otherTo), insert: down ? other + gap + body : body + gap + other },
+    selection: EditorSelection.single(shift(range.anchor), shift(range.head)),
+    scrollIntoView: true, userEvent: 'move.list',
+  }));
+  return true;
+}
+export const markdownListMoveUp = withinSource(target => moveListItem(target, false) || moveLineUp(target));
+export const markdownListMoveDown = withinSource(target => moveListItem(target, true) || moveLineDown(target));

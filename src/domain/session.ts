@@ -1,7 +1,7 @@
 import { compose, type SourceFile } from './documents';
 
 export interface FilePosition { path: string; offset: number }
-export interface EditorPosition { anchor: FilePosition; head: FilePosition; scrollTop: number }
+export interface EditorPosition { anchor: FilePosition; head: FilePosition; scrollTop: number; folds?: { from: FilePosition; to: FilePosition }[] }
 export interface SessionTab { id: string; kind: 'theme' | 'note' | 'material' | 'materials'; pinned: boolean; view?: EditorPosition }
 export interface SessionPane { tabs: SessionTab[]; active: string | null }
 export interface WorkspaceSession {
@@ -42,7 +42,8 @@ export function readSession(value: unknown): WorkspaceSession | null {
     const tabs: SessionTab[] = [];
     for (const tab of pane.tabs) {
       if (!record(tab) || typeof tab.id !== 'string' || !['theme', 'note', 'material', 'materials'].includes(String(tab.kind)) || tabs.some(t => t.id === tab.id)) continue;
-      tabs.push({ id: tab.id, kind: tab.kind as SessionTab['kind'], pinned: tab.pinned === true, ...(editorPosition(tab.view) ? { view: tab.view } : {}) });
+      const view = editorPosition(tab.view) ? { anchor: tab.view.anchor, head: tab.view.head, scrollTop: tab.view.scrollTop, ...(Array.isArray(tab.view.folds) ? { folds: tab.view.folds.filter(fold => record(fold) && position(fold.from) && position(fold.to) && fold.from.path === fold.to.path && fold.to.offset > fold.from.offset) } : {}) } : undefined;
+      tabs.push({ id: tab.id, kind: tab.kind as SessionTab['kind'], pinned: tab.pinned === true, ...(view ? { view } : {}) });
     }
     return { tabs, active: tabs.some(t => t.id === pane.active) ? pane.active as string : tabs[0]?.id ?? null };
   }) as WorkspaceSession['panes'];

@@ -1,11 +1,12 @@
 import { StateEffect, StateField, type EditorState, type Range } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, type DecorationSet } from '@codemirror/view';
-import { commonmarkLanguage } from '@codemirror/lang-markdown';
+import { markdownLanguage } from '@codemirror/lang-markdown';
 import { compose } from '../../domain/documents';
 import { sourceFilesEffect, sourceFilesField } from './source-model';
 import { decode, noteReferences, resolveNote, type NoteIndex } from '../../domain/note-links';
 import { markdownDestination } from '../../domain/markdown';
 import { location, materialCatalog } from '../../domain/materials';
+import { taskMarker } from './task-list';
 export { markdownDestination } from '../../domain/markdown';
 
 export const noteIndexEffect = StateEffect.define<NoteIndex>();
@@ -31,13 +32,13 @@ class ResourceLabel extends WidgetType {
     const path = document.createElementNS(svg.namespaceURI, 'path');
     path.setAttribute('d', this.type === 'folder' ? 'M3 7V4h6l3 3h9v13H3Z' : this.type === 'excel' ? 'M4 3h16v18H4ZM4 9h16M4 15h16M10 3v18' : this.type === 'web' ? 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM3 12h18M12 3c-5 5-5 13 0 18 5-5 5-13 0-18' : 'M5 3h9l5 5v13H5ZM14 3v6h5M8 14h8M8 17h6');
     svg.append(path); const text = document.createElement('span'); text.textContent = this.label.replace(/\\([\\[\]])/g, '$1'); link.append(svg, text);
-    const info = document.createElement('button'); info.type = 'button'; info.className = 'cm-resource-info'; info.dataset.materialInfo = this.page; info.setAttribute('aria-label', `${this.label}の資料プロパティ`); info.title = '資料のプロパティ'; info.textContent = 'ⓘ';
+    const info = document.createElement('button'); info.type = 'button'; info.className = 'cm-resource-info'; info.dataset.materialInfo = this.page; info.setAttribute('aria-label', `${this.label}の資料詳細`); info.title = '資料の詳細'; info.textContent = 'ⓘ';
     group.append(link, info); return group;
   }
   ignoreEvent() { return false; }
 }
 
-type MarkdownTree = ReturnType<typeof commonmarkLanguage.parser.parse>;
+type MarkdownTree = ReturnType<typeof markdownLanguage.parser.parse>;
 interface ParsedSource { path: string; text: string; from: number; tree: MarkdownTree }
 interface Preview { sources: ParsedSource[]; decorations: DecorationSet; hidden: DecorationSet }
 
@@ -53,13 +54,32 @@ class CodeLanguage extends WidgetType {
   ignoreEvent() { return false; }
 }
 
+class TaskCheckbox extends WidgetType {
+  constructor(readonly checkFrom: number, readonly checked: boolean, readonly label: string, readonly disabled: boolean) { super(); }
+  eq(other: TaskCheckbox) { return this.checkFrom === other.checkFrom && this.checked === other.checked && this.label === other.label && this.disabled === other.disabled; }
+  toDOM(view: EditorView) {
+    const wrap = document.createElement('span'); wrap.className = 'cm-task-control';
+    const input = document.createElement('input'); input.type = 'checkbox'; input.checked = this.checked; input.disabled = this.disabled;
+    input.setAttribute('aria-label', this.label || '空のタスク'); input.title = '完了／未完了を切り替え（Ctrl+L）';
+    input.addEventListener('mousedown', event => event.preventDefault());
+    input.addEventListener('click', event => {
+      event.stopPropagation();
+      if (view.state.readOnly) { input.checked = this.checked; return; }
+      view.dispatch({ changes: { from: this.checkFrom, to: this.checkFrom + 1, insert: input.checked ? 'x' : ' ' }, userEvent: 'input.task' });
+      view.focus();
+    });
+    wrap.append(input); return wrap;
+  }
+  ignoreEvent() { return true; }
+}
+
 function preview(state: EditorState, previous?: Preview): Preview {
   const files = state.field(sourceFilesField);
   const index = state.field(noteIndexField, false) ?? { targets: [], files: new Map() };
   const resources = new Map(materialCatalog(index).materials.map(item => [location(item.path).key, item]));
   const { segments } = compose(files);
   const sources = files.map((file, index) => ({ path: file.path, text: file.content, from: segments[index].from,
-    tree: previous?.sources.find(source => source.path === file.path && source.text === file.content)?.tree ?? commonmarkLanguage.parser.parse(file.content) }));
+    tree: previous?.sources.find(source => source.path === file.path && source.text === file.content)?.tree ?? markdownLanguage.parser.parse(file.content) }));
   const ranges: Range<Decoration>[] = [], hidden: Range<Decoration>[] = [];
   const edited = (from: number, to: number) => state.selection.ranges.some(range => {
     const start = state.doc.lineAt(range.from).from, end = state.doc.lineAt(range.to).to;
@@ -77,6 +97,7 @@ function preview(state: EditorState, previous?: Preview): Preview {
 
   for (const source of sources) {
     const base = source.from;
+    const frontmatter = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/.exec(source.text)?.[0].length ?? 0;
     const refs = noteReferences(source.path, source.text);
     for (const ref of refs.filter(ref => ref.syntax === 'wiki')) {
       const resolved = resolveNote(index, ref.target, source.path);
@@ -112,6 +133,11 @@ function preview(state: EditorState, previous?: Preview): Preview {
         mark(from, to, node.name === 'StrongEmphasis' ? 'cm-preview-strong' : 'cm-preview-emphasis');
         if (!active) for (const child of node.node.getChildren('EmphasisMark')) hide(base + child.from, base + child.to);
       }
+      if (node.name === 'Strikethrough') {
+        mark(from, to, 'cm-preview-strike');
+        if (!active) for (const child of node.node.getChildren('StrikethroughMark')) hide(base + child.from, base + child.to);
+      }
+      if (node.name === 'HorizontalRule' && !active && node.from >= frontmatter) line(from, 'cm-preview-rule');
       if (node.name === 'InlineCode') {
         mark(from, to, 'cm-preview-inline-code');
         if (!active) {
@@ -153,7 +179,14 @@ function preview(state: EditorState, previous?: Preview): Preview {
       if (node.name === 'QuoteMark' && !active) hide(from, to + (state.doc.sliceString(to, to + 1) === ' ' ? 1 : 0));
       // Preserve the original glyph's width and text positions. Replacing the
       // marker with an atomic widget shifts vertical navigation on every line.
-      if (node.name === 'ListMark' && /^[-+*]$/.test(source.text.slice(node.from, node.to))) ranges.push(Decoration.mark({ class: 'cm-list-bullet', attributes: { 'aria-hidden': 'true' } }).range(from, to));
+      if (node.name === 'ListMark') {
+        const task = node.from < frontmatter ? null : taskMarker(source.text, node.to);
+        if (task) {
+          const bodyFrom = base + task.bodyFrom, label = state.doc.sliceString(bodyFrom, state.doc.lineAt(bodyFrom).to);
+          ranges.push(Decoration.mark({ class: 'cm-task-prefix', attributes: { 'aria-hidden': 'true' } }).range(from, bodyFrom));
+          ranges.push(Decoration.widget({ widget: new TaskCheckbox(base + task.checkFrom, task.checked, label, state.readOnly), side: -1 }).range(from));
+        } else if (/^[-+*]$/.test(source.text.slice(node.from, node.to))) ranges.push(Decoration.mark({ class: 'cm-list-bullet', attributes: { 'aria-hidden': 'true' } }).range(from, to));
+      }
       if (node.name === 'Link' || node.name === 'Autolink') {
         if (refs.some(ref => ref.syntax === 'wiki' && ref.from <= node.from && ref.to >= node.to)) return false;
         const url = node.node.getChild('URL');
@@ -186,7 +219,7 @@ function preview(state: EditorState, previous?: Preview): Preview {
 export const livePreview = StateField.define<Preview>({
   create: state => preview(state),
   update(value, transaction) {
-    return transaction.docChanged || transaction.selection || transaction.effects.some(effect => effect.is(sourceFilesEffect) || effect.is(noteIndexEffect)) ? preview(transaction.state, value) : value;
+    return transaction.docChanged || transaction.selection || transaction.reconfigured || transaction.effects.some(effect => effect.is(sourceFilesEffect) || effect.is(noteIndexEffect)) ? preview(transaction.state, value) : value;
   },
   provide: field => [EditorView.decorations.from(field, value => value.decorations), EditorView.atomicRanges.of(view => view.state.field(field).hidden)],
 });

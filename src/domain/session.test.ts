@@ -5,6 +5,13 @@ import { documentPosition, filePosition, readSession } from './session';
 const file = (path: string, content: string) => fromDisk({ path, content, revision: path });
 
 describe('作業位置と画面状態の復元', () => {
+  it('折り畳みの保存位置は同一ファイル内の有効な範囲だけを復元する', () => {
+    const point = (offset: number, path = 'メモ/a.md') => ({ path, offset });
+    const session = readSession({ version: 1, panes: [{ tabs: [{ id: 'メモ/a.md', kind: 'note', view: { anchor: point(0), head: point(0), scrollTop: 0, folds: [
+      { from: point(5), to: point(10) }, null, { from: point(-1), to: point(3) }, { from: point(9), to: point(8) }, { from: point(1), to: point(4, '別.md') },
+    ] } }] }, { tabs: [] }] });
+    expect(session?.panes[0].tabs[0].view?.folds).toEqual([{ from: point(5), to: point(10) }]);
+  });
   it('前の月が増減してもファイル内の編集位置に戻る', () => {
     const files = [file('テーマ/試験/2026-10.md', '先月\n'), file('テーマ/試験/2026-11.md', '今月の記録')];
     const saved = filePosition(files, 8);

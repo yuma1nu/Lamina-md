@@ -3,7 +3,7 @@ import { EditorSelection, EditorState, type StateCommand } from '@codemirror/sta
 import { markdown } from '@codemirror/lang-markdown';
 import { compose, fromDisk } from '../../domain/documents';
 import { sourceFilesField } from './source-model';
-import { markdownBackspace, markdownEnter, markdownListDedent, markdownListIndent, markdownSoftBreak } from './markdown-commands';
+import { markdownBackspace, markdownDelete, markdownEnter, markdownListDedent, markdownListIndent, markdownListMoveUp, markdownListMoveDown, markdownSoftBreak } from './markdown-commands';
 
 function editor(marked: string) {
   const anchor = marked.indexOf('|'), end = marked.lastIndexOf('|');
@@ -14,6 +14,48 @@ function editor(marked: string) {
 }
 
 describe('箇条書きの構造を保つ入力', () => {
+  it('長い月次記録の末尾でもEnterの補完を継続する', () => {
+    const prefix = '# 2026-11-01\n\n' + '実験条件と結果を記録する。\n\n'.repeat(800);
+    const edit = editor(prefix + '- 今回の結果|');
+    edit.run(markdownEnter);
+    expect(edit.text()).toBe(prefix + '- 今回の結果\n- ');
+  });
+  it('長文末尾でも番号・タスク・子項目・引用を繰り返し補完する', () => {
+    const prefix = '記録。\n\n'.repeat(1000);
+    for (const [body, continuation] of [['1. 確認', '2. '], ['- [x] 確認', '- [ ] '], ['- 親\n    - 子', '    - '], ['> - 確認', '> - ']]) {
+      const edit = editor(prefix + body + '|'); edit.run(markdownEnter);
+      expect(edit.text()).toBe(prefix + body + '\n' + continuation);
+    }
+  });
+  it('Deleteで次の項目の記号・チェック欄と字下げを残さず結合する', () => {
+    for (const [marked, expected] of [
+      ['- 前|\n- 後', '- 前後'], ['1. 前|\n2. 後', '1. 前後'],
+      ['- [ ] 前|\n- [x] 後', '- [ ] 前後'], ['> - 前|\n> - 後', '> - 前後'],
+      ['- 前|\n    - 子\n        - 孫\n- 次', '- 前子\n    - 孫\n- 次'],
+      ['- 前\n  継続|\n- 後', '- 前\n  継続後'],
+    ]) { const edit = editor(marked); expect(edit.run(markdownDelete)).toBe(true); expect(edit.text()).toBe(expected); }
+    const normal = editor('- 本文|\n```\n- コード\n```'); expect(normal.run(markdownDelete)).toBe(false);
+  });
+  it('項目を子孫・複数段落・コードと一緒に上下へ移し、キャレットも追従する', () => {
+    const body = '- 前\n- 親\n    - 子\n        - 孫\n\n    ```ts\n    const n = 1;\n    ```\n- 後';
+    const edit = editor(body.replace('親', '親|')); edit.run(markdownListMoveDown);
+    expect(edit.text()).toBe('- 前\n- 後\n- 親\n    - 子\n        - 孫\n\n    ```ts\n    const n = 1;\n    ```');
+    expect(edit.text().slice(0, edit.state().selection.main.head)).toBe('- 前\n- 後\n- 親');
+    edit.run(markdownListMoveUp); expect(edit.text()).toBe(body);
+  });
+  it('兄弟の複数選択をまとめて移動し、親・日付見出しの外へ出さない', () => {
+    const edit = editor('# 日付\n- 一\n|- 二\n- 三\n|- 四'); edit.run(markdownListMoveDown);
+    expect(edit.text()).toBe('# 日付\n- 一\n- 四\n- 二\n- 三');
+    expect(edit.state().sliceDoc(edit.state().selection.main.from, edit.state().selection.main.to)).toBe('- 二\n- 三');
+    const child = editor('- 親\n    - 子|\n- 次'); child.run(markdownListMoveDown); child.run(markdownListMoveUp);
+    expect(child.text()).toBe('- 親\n    - 子\n- 次');
+    const first = editor('# 日付\n- 一|\n- 二'); first.run(markdownListMoveUp); expect(first.text()).toBe('# 日付\n- 一\n- 二');
+  });
+  it('空項目と同階層の子項目も上下移動できる', () => {
+    for (const [marked, expected] of [['- 一\n- |\n- 三', '- 一\n- 三\n- '], ['- 親\n    - 一|\n    - 二\n- 次', '- 親\n    - 二\n    - 一\n- 次']]) {
+      const edit = editor(marked); edit.run(markdownListMoveDown); expect(edit.text()).toBe(expected);
+    }
+  });
   it('親のない先頭項目と、親を飛ばす繰り返しの字下げを止める', () => {
     const first = editor('|- 親\n- 子'); expect(first.run(markdownListIndent)).toBe(true); expect(first.text()).toBe('- 親\n- 子');
     const second = editor('- 親\n- 子|'); second.run(markdownListIndent);
@@ -61,6 +103,17 @@ describe('箇条書きの構造を保つ入力', () => {
     const { text, segments } = compose(files);
     const state = EditorState.create({ doc: text, selection: { anchor: segments[1].to }, extensions: [sourceFilesField.init(() => files)] });
     let changed = false; expect(markdownListIndent({ state, dispatch: () => { changed = true; } })).toBe(true); expect(changed).toBe(false);
+  });
+  it('長い翌月の改行はその月へ保存し、移動やDeleteで月境界を越えない', () => {
+    const files = [fromDisk({ path: 'テーマ/評価/2026-10.md', content: '- 先月', revision: 'a' }), fromDisk({ path: 'テーマ/評価/2026-11.md', content: '# 記録\n\n' + '結果\n\n'.repeat(1000) + '- 今月', revision: 'b' })];
+    const { text, segments } = compose(files);
+    let state = EditorState.create({ doc: text, selection: { anchor: segments[1].to }, extensions: [sourceFilesField.init(() => files)] });
+    const run = (command: StateCommand) => command({ state, dispatch: tr => { state = tr.state; } });
+    run(markdownListMoveDown); expect(state.doc.toString()).toBe(text);
+    run(markdownEnter); expect(state.field(sourceFilesField)[1].content).toBe(files[1].content + '\n- ');
+    state = state.update({ selection: { anchor: segments[0].to } }).state;
+    const before = state.doc.toString(); run(markdownDelete); run(markdownListMoveDown);
+    expect(state.doc.toString()).toBe(before); expect(state.field(sourceFilesField)[0].content).toBe(files[0].content);
   });
   it('Shift+Enterは同じ項目の継続文を作り、次のEnterで項目を続ける', () => {
     const edit = editor('- 親\n    - 項目|'); edit.run(markdownSoftBreak);

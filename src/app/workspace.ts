@@ -24,6 +24,7 @@ export interface Workspace {
   busy: boolean;
   closing: boolean;
   inspector: 'outline' | 'backlinks';
+  materialDetail: { path: string; pane: 0 | 1; documentId: string } | null;
   missingLink: { target: string; sourcePath: string; pane: 0 | 1; newTab: boolean } | null;
   selectionText: string;
   annotationOpen: boolean;
@@ -31,7 +32,7 @@ export interface Workspace {
   error: string | null;
   jump: { id: string; anchor: number; sequence: number } | null;
 }
-const initial = (): Workspace => ({ vault: null, catalog: null, documents: {}, panes: [{ tabs: [], active: null }, { tabs: [], active: null }], activePane: 0, split: false, outline: true, sidebar: true, views: [{}, {}], busy: false, closing: false, inspector: 'backlinks', missingLink: null, selectionText: '', annotationOpen: false, materialOpen: false, error: null, jump: null });
+const initial = (): Workspace => ({ vault: null, catalog: null, documents: {}, panes: [{ tabs: [], active: null }, { tabs: [], active: null }], activePane: 0, split: false, outline: true, sidebar: true, views: [{}, {}], busy: false, closing: false, inspector: 'backlinks', materialDetail: null, missingLink: null, selectionText: '', annotationOpen: false, materialOpen: false, error: null, jump: null });
 export const useWorkspace = create<Workspace>(initial);
 const store = useWorkspace;
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -44,6 +45,8 @@ export class WorkspaceController {
   private startup?: Promise<void>;
   private generation = 0;
   private externalTimer?: ReturnType<typeof setTimeout>;
+  private closedTabs: { id: string; pane: 0 | 1; pinned: boolean }[] = [];
+  private closingTabs = new Set<string>();
   private cachedIndex?: { catalog: Catalog | null; documents: Workspace['documents']; vault: VaultSnapshot | null; index: NoteIndex };
   index(): NoteIndex {
     const state = store.getState(), cached = this.cachedIndex;
@@ -175,6 +178,10 @@ export class WorkspaceController {
     catch (error) { store.setState({ error: `資料を開けませんでした。\n${message(error)}` }); }
   }
   materials() { return materialCatalog(this.index()); }
+  showMaterialDetail(path: string, pane: 0 | 1, documentId: string) {
+    if (store.getState().busy || store.getState().closing) return;
+    store.setState({ materialDetail: { path, pane, documentId }, outline: true });
+  }
   openMaterials(pane: 0 | 1 = store.getState().activePane) { this.attach({ id: '@materials', label: '資料一覧', kind: 'materials', files: [] }, pane, true); }
   async saveMaterial(value: MaterialProperties, original?: Material, insertion?: MaterialInsertion, merge?: Material, body?: string) {
     return this.change((_catalog, index) => {
@@ -267,6 +274,26 @@ export class WorkspaceController {
   async relocate(source: string, destination: string) {
     return this.change((catalog, before) => this.relocation(catalog, before, source, destination));
   }
+  async deleteNote(path: string): Promise<boolean> {
+    if (store.getState().busy || store.getState().closing) return false;
+    store.setState({ busy: true }); this.generation++;
+    let removed = false;
+    try {
+      await this.flushDocuments();
+      const read = await this.api.readCatalog(), catalog = await this.repairCatalog(read);
+      const file = catalog.files.find(file => file.path === path);
+      if (!path.startsWith('メモ/') || !catalog.snapshot.notes.some(note => note.path === path) || !file) throw new Error('削除するメモが見つかりません。');
+      const loaded = store.getState().documents[path]?.files[0];
+      if (loaded && loaded.revision !== file.revision) throw new Error('メモが外部で変更されています。再読み込みしてから削除してください。');
+      const result = await this.api.trashNote(path, file.revision);
+      removed = true;
+      this.installCatalog(result, read.moves);
+      this.closedTabs = this.closedTabs.filter(tab => tab.id !== path);
+      await this.sessionQueue.run('workspace');
+      store.setState({ error: null }); return true;
+    } catch (error) { store.setState({ error: removed ? `メモは退避済みです。画面状態の保存を完了できませんでした。\n${store.getState().error ?? message(error)}` : message(error) }); return removed; }
+    finally { store.setState({ busy: false }); }
+  }
   private relocation(catalog: Catalog, before: NoteIndex, source: string, destination: string) {
     const moves = [{ from: source, to: destination }], snapshot = movedSnapshot(catalog.snapshot, moves);
     const after = makeIndex(snapshot, catalog.files.map(file => ({ ...file, path: mapPath(file.path, moves) })));
@@ -336,6 +363,7 @@ export class WorkspaceController {
     try {
       await this.flush();
       const vault = await this.api.openVault(root, initialize);
+      this.closedTabs = [];
       store.setState({ ...initial(), vault, busy: true });
       localStorage.setItem('lamina.lastVault', vault.root);
       const read = await this.api.readCatalog();
@@ -361,13 +389,17 @@ export class WorkspaceController {
       const id = mapPath(document.id, moves), target = index.targets.find(target => target.id === id);
       if (target) documents[id] = { id, label: target.name, kind: target.kind, files: target.files.flatMap(path => index.files.has(path) ? [index.files.get(path)!] : []) };
     }
-    for (const pane of [0, 1] as const) for (const [id, view] of Object.entries(state.views[pane])) views[pane][mapPath(id, moves)] = { ...view, anchor: { ...view.anchor, path: mapPath(view.anchor.path, moves) }, head: { ...view.head, path: mapPath(view.head.path, moves) } };
+    for (const pane of [0, 1] as const) for (const [id, view] of Object.entries(state.views[pane])) if (documents[mapPath(id, moves)]) views[pane][mapPath(id, moves)] = { ...view, anchor: { ...view.anchor, path: mapPath(view.anchor.path, moves) }, head: { ...view.head, path: mapPath(view.head.path, moves) }, ...(view.folds ? { folds: view.folds.map(fold => ({ from: { ...fold.from, path: mapPath(fold.from.path, moves) }, to: { ...fold.to, path: mapPath(fold.to.path, moves) } })) } : {}) };
     const panes = state.panes.map(pane => {
       const tabs = pane.tabs.map(tab => ({ ...tab, id: mapPath(tab.id, moves) })).filter((tab, index, all) => documents[tab.id] && all.findIndex(other => other.id === tab.id) === index);
       const active = pane.active ? mapPath(pane.active, moves) : null;
       return { tabs, active: tabs.some(tab => tab.id === active) ? active : tabs.at(-1)?.id ?? null };
     }) as Workspace['panes'];
-    store.setState({ vault: catalog.snapshot, catalog, documents, panes, views, selectionText: '', jump: null });
+    this.closedTabs = this.closedTabs.map(tab => ({ ...tab, id: mapPath(tab.id, moves) }));
+    const materialDetail = state.materialDetail ? { ...state.materialDetail, path: mapPath(state.materialDetail.path, moves), documentId: mapPath(state.materialDetail.documentId, moves) } : null;
+    store.setState({ vault: catalog.snapshot, catalog, documents, panes, views, selectionText: '', jump: null,
+      materialDetail: materialDetail && documents[materialDetail.documentId] && index.files.has(materialDetail.path) ? materialDetail : null,
+      ...(state.split && !panes[1].tabs.length ? { split: false, activePane: 0 as const } : {}) });
   }
   async refresh() {
     if (store.getState().annotationOpen || store.getState().materialOpen) return;
@@ -387,7 +419,7 @@ export class WorkspaceController {
     if (!session) return;
     for (const pane of session.panes) {
       if (pane.active) pane.active = mapPath(pane.active, moves);
-      for (const tab of pane.tabs) { tab.id = mapPath(tab.id, moves); if (tab.view) { tab.view.anchor.path = mapPath(tab.view.anchor.path, moves); tab.view.head.path = mapPath(tab.view.head.path, moves); } }
+      for (const tab of pane.tabs) { tab.id = mapPath(tab.id, moves); if (tab.view) { tab.view.anchor.path = mapPath(tab.view.anchor.path, moves); tab.view.head.path = mapPath(tab.view.head.path, moves); for (const fold of tab.view.folds ?? []) { fold.from.path = mapPath(fold.from.path, moves); fold.to.path = mapPath(fold.to.path, moves); } } }
     }
     const documents: Workspace['documents'] = {};
     const views: Workspace['views'] = [{}, {}];
@@ -483,6 +515,10 @@ export class WorkspaceController {
   }
   async closeTab(pane: 0 | 1, id: string) {
     if (store.getState().closing || store.getState().busy) return;
+    const key = `${pane}:${id}`;
+    if (this.closingTabs.has(key) || !store.getState().panes[pane].tabs.some(tab => tab.id === id)) return;
+    this.closingTabs.add(key);
+    const pinned = store.getState().panes[pane].tabs.find(tab => tab.id === id)?.pinned ?? false;
     const generation = this.generation;
     try {
       do { await this.queue.run(id); } while (store.getState().documents[id]?.files.some(isDirty));
@@ -490,10 +526,13 @@ export class WorkspaceController {
       store.setState(state => {
         const group = state.panes[pane], tabs = group.tabs.filter(t => t.id !== id);
         const panes = [...state.panes] as Workspace['panes'];
-        panes[pane] = { tabs, active: group.active === id ? tabs.at(-1)?.id ?? null : group.active };
+        const neighbor = Math.min(group.tabs.findIndex(tab => tab.id === id), tabs.length - 1);
+        panes[pane] = { tabs, active: group.active === id ? tabs[neighbor]?.id ?? null : group.active };
         return { panes, ...(pane === 1 && tabs.length === 0 ? { split: false, activePane: 0 as const } : {}) };
       });
+      this.closedTabs.push({ id, pane, pinned }); this.closedTabs = this.closedTabs.slice(-30);
     } catch { /* The save error remains visible and the tab stays open. */ }
+    finally { this.closingTabs.delete(key); }
   }
   activate(pane: 0 | 1, id?: string) {
     if (store.getState().closing || store.getState().busy) return;
@@ -502,6 +541,27 @@ export class WorkspaceController {
       if (id) panes[pane] = { ...panes[pane], active: id };
       return { activePane: pane, panes };
     });
+  }
+  cycleTab(backward = false) {
+    const state = store.getState(), group = state.panes[state.activePane]; if (!group.tabs.length) return;
+    const index = group.tabs.findIndex(tab => tab.id === group.active);
+    this.activate(state.activePane, group.tabs[(index + (backward ? -1 : 1) + group.tabs.length) % group.tabs.length].id);
+  }
+  selectTab(number: number) {
+    const state = store.getState(), tabs = state.panes[state.activePane].tabs;
+    const tab = number === 9 ? tabs.at(-1) : tabs[number - 1]; if (tab) this.activate(state.activePane, tab.id);
+  }
+  restoreClosedTab() {
+    if (store.getState().busy || store.getState().closing) return;
+    for (let tab; (tab = this.closedTabs.pop());) {
+      const document = store.getState().documents[tab.id];
+      if (document) {
+        const exists = store.getState().panes[tab.pane].tabs.some(open => open.id === tab.id);
+        this.attach(document, tab.pane, true);
+        if (!exists && tab.pinned) this.togglePin(tab.pane, tab.id);
+        return;
+      }
+    }
   }
   togglePin(pane: 0 | 1, id: string) {
     if (store.getState().closing || store.getState().busy) return;
