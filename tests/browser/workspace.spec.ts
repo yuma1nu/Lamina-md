@@ -1,178 +1,7 @@
+import { connectTestVault } from './fixtures/vault';
 import { test, expect, type Page } from '@playwright/test';
 import type { WorkspaceSession } from '../../src/domain/session';
-import type { Operation } from '../../src/domain/note-links';
-import type { ImageFile, ImageWrite } from '../../src/domain/images';
 import { materialDraft, writeMaterial } from '../../src/domain/materials';
-
-interface TestFixture {
-  trash?: Record<string, { content: string; revision: string }>;
-  trashFailure?: boolean;
-  images: Record<string, ImageFile>;
-  files: Record<string, { content: string; revision: string; identity?: string }>;
-  failure: boolean;
-  sessionFailure: boolean;
-  destroyed: number;
-  operations: string[];
-  holdSave: boolean;
-  pendingSaves: number;
-  releaseSave?: () => void;
-  openedUrls: string[];
-  openFailure: boolean;
-  operationFailure: boolean;
-  folders: string[];
-  clipboard?: { paths: string[]; title: string | null; text: string | null };
-  resourceFolders?: string[];
-  moveOffline: (from: string, to: string) => void;
-}
-declare global { interface Window { __laminaFixture: TestFixture; __laminaClose: () => Promise<void>; __laminaChanged: () => Promise<void>; __laminaDrop: (paths: string[], x: number, y: number) => Promise<void> } }
-
-// Only this test boundary substitutes IPC. The shipped app has no sample vault
-// or in-memory filesystem fallback. These tests do not verify Rust/WebView2.
-async function connectTestVault(page: Page) {
-  await page.clock.install({ time: new Date('2026-11-12T01:00:00Z') });
-  await page.addInitScript(() => {
-    const disk = JSON.parse(localStorage.getItem('lamina.test.disk') ?? 'null') as { files: TestFixture['files']; themes: string[]; counter: number; folders?: string[]; themeIds?: Record<string, string>; images?: Record<string, ImageFile> } | null;
-    const files: TestFixture['files'] = disk?.files ?? {
-      'テーマ/耐久性評価/2026-10.md': { content: '# 2026-10-31\n\n初回の試験を完了した。\n', revision: 'oct' },
-      'テーマ/耐久性評価/2026-11.md': { content: '# 2026-11-11\n\n温度推移を確認した。\n', revision: 'nov' },
-      'メモ/試験の手順.md': { content: '## 測定の手順\n\n記録先を確認する。', revision: 'note' },
-    };
-    for (const [path, file] of Object.entries(files)) file.identity ??= path;
-    const themeIds = disk?.themeIds ?? {};
-    const fixture: TestFixture & { themes: string[]; counter: number } = { images: disk?.images ?? {}, files, failure: false, sessionFailure: false, themes: disk?.themes ?? ['耐久性評価'], counter: disk?.counter ?? 0, destroyed: 0, operations: [], holdSave: false, pendingSaves: 0, openedUrls: [], openFailure: false, operationFailure: false, folders: disk?.folders ?? [], moveOffline: () => {} };
-    const persistDisk = () => localStorage.setItem('lamina.test.disk', JSON.stringify({ files, themes: fixture.themes, counter: fixture.counter, folders: fixture.folders, themeIds, images: fixture.images }));
-    const callbacks = new Map<number, (event: unknown) => Promise<void>>();
-    const listeners = new Map<number, { event: string; handler: number }>();
-    Object.assign(window, { __laminaFixture: fixture, isTauri: true });
-    const snapshot = () => ({ root: 'C:/TestVault', name: '技術ノート', noteFolders: fixture.folders, themes: fixture.themes.map(name => ({ path: `テーマ/${name}`, name: name.split('/').at(-1), files: Object.keys(files).filter(path => path.split('/').slice(0, -1).join('/') === `テーマ/${name}`).sort().map(path => ({ path, name: path.split('/').at(-1) })) })), notes: Object.keys(files).filter(path => path.startsWith('メモ/')).map(path => ({ path, name: path.split('/').at(-1) })), materials: Object.keys(files).filter(path => path.startsWith('資料/')).map(path => ({ path, name: path.split('/').at(-1) })) });
-    const currentEntries = () => [
-      ...Object.keys(files).map(path => ({ path, kind: path.startsWith('メモ/') ? 'note' : 'month', identity: files[path].identity ?? path, signature: files[path].content })),
-      ...fixture.themes.map(name => { const path = `テーマ/${name}`; themeIds[path] ??= path; return { path, kind: 'theme', identity: themeIds[path], signature: Object.entries(files).filter(([key]) => key.startsWith(path + '/')).map(([, file]) => file.content).join('\n') }; }),
-    ];
-    const catalog = () => {
-      const current = currentEntries(), previous = JSON.parse(localStorage.getItem('lamina.test.tracking') ?? 'null') as typeof current | null;
-      const moves = (previous ?? []).filter(old => !current.some(next => next.path === old.path)).flatMap(old => {
-        const matches = current.filter(next => !previous?.some(entry => entry.path === next.path) && next.kind === old.kind && next.path.split('/').at(-1) === old.path.split('/').at(-1) && next.identity === old.identity);
-        return matches.length === 1 ? [{ from: old.path, to: matches[0].path }] : [];
-      });
-      return { snapshot: snapshot(), files: Object.entries(files).map(([path, file]) => ({ ...file, path })), previous: previous ?? current, moves, warnings: [] };
-    };
-    const rebase = (path: string, from: string, to: string) => path === from || path.startsWith(from + '/') ? to + path.slice(from.length) : path;
-    fixture.moveOffline = (from, to) => {
-      for (const path of Object.keys(files)) { const next = rebase(path, from, to); if (next !== path) { files[next] = files[path]; delete files[path]; } }
-      fixture.themes = fixture.themes.map(name => { const old = `テーマ/${name}`, next = rebase(old, from, to); if (old !== next) { themeIds[next] = themeIds[old] ?? old; delete themeIds[old]; } return next.slice('テーマ/'.length); });
-      fixture.folders = fixture.folders.map(path => rebase(path, from, to));
-      persistDisk();
-    };
-    Object.assign(window, {
-      __laminaClose: async () => {
-        for (const [id, listener] of listeners) if (listener.event === 'tauri://close-requested') await callbacks.get(listener.handler)?.({ event: listener.event, id, payload: null });
-      },
-      __laminaChanged: async () => { for (const [id, listener] of listeners) if (listener.event === 'vault-changed') await callbacks.get(listener.handler)?.({ event: listener.event, id, payload: 'C:/TestVault' }); },
-      __laminaDrop: async (paths: string[], x: number, y: number) => { for (const [id, listener] of listeners) if (listener.event === 'tauri://drag-drop') await callbacks.get(listener.handler)?.({ event: listener.event, id, payload: { paths, position: { x, y } } }); },
-      __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener(_event: string, id: number) { listeners.delete(id); } },
-      __TAURI_INTERNALS__: {
-        metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
-        transformCallback: (callback: (event: unknown) => Promise<void>) => { const id = ++fixture.counter; callbacks.set(id, callback); return id; },
-        invoke: async (command: string, args: Record<string, unknown>) => {
-          if (command === 'plugin:dialog|open') return 'C:/TestVault';
-          if (command === 'plugin:event|listen') { const id = ++fixture.counter; listeners.set(id, { event: String(args.event), handler: Number(args.handler) }); return id; }
-          if (command === 'plugin:event|unlisten') return;
-          if (command === 'plugin:window|destroy') { fixture.destroyed++; fixture.operations.push('destroy'); return; }
-          if (command === 'open_vault') return snapshot();
-          if (command === 'read_image') {
-            const image = fixture.images[String(args.path)]; if (!image) throw new Error('画像がありません');
-            return { ...image, ...(args.editing ? {} : { original: null, annotation: null }) };
-          }
-          if (command === 'write_image') {
-            if (fixture.operationFailure) throw new Error('画像のテスト用保存失敗');
-            const write = args.write as unknown as ImageWrite;
-            if (write.path && fixture.images[write.path]?.revision !== write.expectedRevision) throw new Error('画像が外部で変更されています');
-            const path = write.path ?? `添付/image-${++fixture.counter}/rendered.png`;
-            const image: ImageFile = { path, mime: 'image/png', data: write.rendered, original: write.original, annotation: write.annotation, revision: `image-r${++fixture.counter}` };
-            fixture.images[path] = image; persistDisk(); return structuredClone(image);
-          }
-          if (command === 'watch_vault') return;
-          if (command === 'read_resource_clipboard') return fixture.clipboard ?? { paths: [], title: null, text: null };
-          if (command === 'inspect_resource') return { title: String(args.path).split(/[\\/]/).at(-1), folder: fixture.resourceFolders?.includes(String(args.path)) ?? false, exists: true };
-          if (command === 'open_resource') { if (fixture.openFailure) throw new Error('資料を起動できませんでした'); fixture.openedUrls.push(String(args.path)); return; }
-          if (command === 'read_catalog') return catalog();
-          if (command === 'trash_note') {
-            const path = String(args.path);
-            if (fixture.trashFailure) throw new Error('削除のテスト用失敗');
-            if (!path.startsWith('メモ/') || files[path]?.revision !== args.expectedRevision) throw new Error('削除するメモに外部変更があります');
-            fixture.trash ??= {}; fixture.trash[path] = structuredClone(files[path]); delete files[path];
-            fixture.operations.push('trash'); persistDisk(); localStorage.setItem('lamina.test.tracking', JSON.stringify(currentEntries()));
-            return catalog();
-          }
-          if (command === 'apply_operation') {
-            if (fixture.operationFailure) throw new Error('操作のテスト用保存失敗');
-            const operation = args.operation as unknown as Operation;
-            for (const guard of operation.guards) if (files[guard.path]?.revision !== guard.revision) throw new Error('外部変更が検出されました');
-            const movement = operation.relocation;
-            if (movement && (files[movement.to] || fixture.folders.includes(movement.to) || fixture.themes.includes(movement.to.slice('テーマ/'.length)))) throw new Error('移動先に同名の項目があります');
-            for (const write of operation.writes) if ((files[write.path]?.revision ?? null) !== write.expectedRevision) throw new Error('同名ファイルまたは外部変更があります');
-            for (const entry of operation.deletes ?? []) if (files[entry.path]?.revision !== entry.revision) throw new Error('統合元に外部変更があります');
-            for (const folder of operation.folders ?? []) if (fixture.folders.includes(folder)) throw new Error('同名のフォルダーがあります');
-            if (movement) fixture.moveOffline(movement.from, movement.to);
-            fixture.folders.push(...operation.folders ?? []);
-            for (const write of operation.writes) {
-              const path = movement ? rebase(write.path, movement.from, movement.to) : write.path;
-              files[path] = { content: write.content, revision: `saved-${++fixture.counter}`, identity: files[path]?.identity ?? path };
-              const parts = path.split('/').slice(1, -1); let parent = 'メモ';
-              if (path.startsWith('メモ/')) for (const part of parts) { parent += '/' + part; if (!fixture.folders.includes(parent)) fixture.folders.push(parent); }
-            }
-            for (const entry of operation.deletes ?? []) delete files[entry.path];
-            if (movement || operation.writes.length || operation.folders?.length) fixture.operations.push('operation');
-            localStorage.setItem('lamina.test.tracking', JSON.stringify(currentEntries())); persistDisk(); return catalog();
-          }
-          if (command === 'open_web_link') {
-            if (fixture.openFailure) throw new Error('ブラウザーを起動できませんでした');
-            fixture.openedUrls.push(String(args.url)); return;
-          }
-          if (command === 'read_workspace') return JSON.parse(localStorage.getItem('lamina.test.workspace') ?? 'null');
-          if (command === 'save_workspace') {
-            if (fixture.sessionFailure) throw new Error('画面状態のテスト用保存失敗');
-            localStorage.setItem('lamina.test.workspace', JSON.stringify(args.session));
-            fixture.operations.push('workspace');
-            return;
-          }
-          if (command === 'read_document') {
-            if (!files[String(args.path)]) throw new Error('ファイルがありません');
-            return { ...files[String(args.path)], path: args.path };
-          }
-          if (command === 'save_document') {
-            if (fixture.failure) throw new Error('テスト用の保存失敗');
-            if (fixture.holdSave) {
-              fixture.pendingSaves++;
-              await new Promise<void>(resolve => { fixture.releaseSave = () => { fixture.holdSave = false; fixture.pendingSaves--; resolve(); }; });
-            }
-            const old = files[String(args.path)];
-            if ((old?.revision ?? null) !== args.expectedRevision) throw new Error('外部変更が検出されました');
-            const next = { content: String(args.content), revision: `saved-${++fixture.counter}`, identity: old?.identity ?? String(args.path) };
-            files[String(args.path)] = next;
-            fixture.operations.push('document');
-            persistDisk();
-            return { ...next, path: args.path };
-          }
-          if (command === 'create_theme') { fixture.themes.push(String(args.name)); persistDisk(); return snapshot(); }
-          if (command === 'create_note') {
-            const path = `メモ/${args.name}.md`;
-            if (files[path]) throw new Error('同名ファイルが存在します');
-            files[path] = { content: '', revision: `new-${++fixture.counter}` };
-            persistDisk();
-            return { ...files[path], path };
-          }
-          throw new Error(`Unhandled test IPC: ${command}`);
-        },
-      },
-    });
-  });
-  await page.goto('/');
-  await page.getByRole('button', { name: '保管庫を開く', exact: true }).last().click();
-  await expect(page.getByRole('navigation', { name: 'テーマ', exact: true })).toBeVisible();
-  await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
-}
 
 test('実ファイル境界を代替したIPC経由で月別編集・保存・今日の生成が動く', async ({ page }) => {
   const errors: string[] = [];
@@ -196,6 +25,76 @@ test('実ファイル境界を代替したIPC経由で月別編集・保存・�
   await expect(page.locator('.cm-heading-1')).toHaveCount(3);
   expect(errors).toEqual([]);
   await page.screenshot({ path: '.tools/qa/workspace.png' });
+});
+
+for (const changed of [false, true]) test(`再アクティブ化後もキャレットと入力先を保持する（外部変更${changed ? 'あり' : 'なし'}）`, async ({ page }) => {
+  const editor = await openMarkdown(page, '- [ ] 入力先'); await editor.press('Control+End');
+  if (changed) await page.evaluate(() => { window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'] = { content: '# 2026-10-31\n\n外部の追記', revision: 'external-focus' }; });
+  await page.evaluate(() => { window.dispatchEvent(new Event('blur')); window.dispatchEvent(new Event('focus')); });
+  await page.clock.runFor(1000); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await expect(editor).toBeFocused();
+  await page.keyboard.insertText('へ追記'); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('- [ ] 入力先へ追記');
+});
+
+for (const prefix of ['- ', '- [ ] ', '1. [ ] ', '    - [ ] ']) test(`${prefix}の改行直後のIME未確定文字を本文色で表示する`, async ({ page }) => {
+  const before = prefix.startsWith('    ') ? '- 親\n' : '';
+  const editor = await openMarkdown(page, before + prefix + '項目'); await editor.press('Control+End'); await editor.press('Enter');
+  const next = prefix.startsWith('1.') ? '2. [ ] ' : prefix;
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+  const colors = await editor.evaluate(element => {
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    let text: Node | null;
+    while ((text = walker.nextNode())) if (text.textContent?.includes('にほん')) {
+      const style = getComputedStyle(text.parentElement!);
+      return { color: style.color, fill: style.webkitTextFillColor, expected: getComputedStyle(element).color, html: text.parentElement!.outerHTML };
+    }
+    return null;
+  });
+  expect(colors, '未確定の文字列がDOMに存在する').not.toBeNull();
+  expect(colors?.color, colors?.html).toBe(colors?.expected); expect(colors?.fill, colors?.html).toBe(colors?.expected);
+  await cdp.send('Input.insertText', { text: '日本' }); await cdp.detach();
+  await editor.press('Control+s'); expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(before + prefix + '項目\n' + next + '日本');
+});
+
+test('空白未入力のタスク末尾でもIME文字を透明にしない', async ({ page }) => {
+  const editor = await openMarkdown(page, '- [ ]'); await editor.press('Control+End');
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+  const text = editor.locator('.cm-line').filter({ hasText: 'にほん' });
+  const color = await text.evaluate(() => {
+    const node = window.getSelection()?.anchorNode;
+    return node?.parentElement ? getComputedStyle(node.parentElement).color : '';
+  });
+  expect(color).toBe(await editor.evaluate(element => getComputedStyle(element).color));
+  await cdp.send('Input.insertText', { text: '日本' }); await cdp.detach();
+});
+
+test('復帰時の外部更新でも検索欄の入力とフォーカスを本文へ移さない', async ({ page }) => {
+  await openMarkdown(page, '本文');
+  const input = page.getByRole('textbox', { name: 'テーマ・メモを絞り込み', exact: true }); await input.fill('試験');
+  await page.evaluate(() => { window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'] = { content: '# 2026-10-31\n\n更新', revision: 'updated' }; window.dispatchEvent(new Event('focus')); });
+  await page.clock.runFor(1000); await expect(input).toBeFocused(); await expect(input).toHaveValue('試験');
+  expect(await input.evaluate(element => (element as HTMLInputElement).selectionStart)).toBe(2);
+});
+
+test('IME変換中の再アクティブ化は更新を待ち、確定後も入力位置を保つ', async ({ page }) => {
+  const editor = await openMarkdown(page, '- [ ] 項目'); await editor.press('Control+End'); await editor.press('Enter');
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send('Input.imeSetComposition', { text: 'にほん', selectionStart: 3, selectionEnd: 3 });
+  await page.evaluate(() => {
+    const shell = document.querySelector<HTMLElement>('.app-shell')!; shell.dataset.inertCount = '0';
+    new MutationObserver(records => { for (const record of records) if (record.attributeName === 'inert') shell.dataset.inertCount = String(Number(shell.dataset.inertCount) + 1); }).observe(shell, { attributes: true, attributeFilter: ['inert'] });
+    window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'] = { content: '# 2026-10-31\n\n更新', revision: 'updated' }; window.dispatchEvent(new Event('focus'));
+  });
+  await page.clock.runFor(1200); await expect(editor).toBeFocused();
+  await expect(page.locator('.app-shell')).toHaveAttribute('data-inert-count', '0');
+  await cdp.send('Input.imeSetComposition', { text: 'にほんご', selectionStart: 4, selectionEnd: 4 });
+  await cdp.send('Input.insertText', { text: '日本語' }); await cdp.detach();
+  await page.clock.runFor(1500); await expect(editor).toBeFocused();
+  await page.keyboard.insertText('の続き'); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('- [ ] 項目\n- [ ] 日本語の続き');
 });
 
 test('Ctrl+Tab・数字・Ctrl+W・Ctrl+Shift+Tで保存しながらタブを操作できる', async ({ page }) => {
@@ -1068,6 +967,54 @@ test('本文の資料情報は右に詳細を開き、メモ・参照元・プ�
   await expect(detail).toContainText('変更したメモ。'); await expect(detail).toContainText('二行目。');
 });
 
+for (const [code, kind, app] of [['x', 'excel', 'Excel'], ['w', 'word', 'Word'], ['p', 'powerpoint', 'PowerPoint']] as const) test(`SharePointの${app}資料は本文・詳細・一覧からアプリで開き、明示的にブラウザも選べる`, async ({ page }) => {
+  const url = `https://team.sharepoint.com/:${code}:/s/Dev/ABC?e=a%2Bb&d=123#view`;
+  const editor = await openMarkdown(page, '記録\n\n'); await editor.press('Control+End'); await pasteResource(page, url);
+  const dialog = page.getByRole('dialog', { name: '資料を登録', exact: true });
+  await expect(dialog.getByRole('combobox', { name: '資料の種類', exact: true })).toHaveValue(kind);
+  await dialog.getByRole('textbox', { name: '資料名', exact: true }).fill('検証資料');
+  await dialog.getByRole('button', { name: '登録して挿入', exact: true }).click(); await expect(dialog).not.toBeVisible();
+  await editor.press('Control+Home'); await editor.locator('a.cm-resource-link').click();
+  const calls = () => page.evaluate(() => window.__laminaFixture.resourceCalls ?? []);
+  await expect.poll(calls).toEqual([{ path: url, kind }]);
+  expect(await page.evaluate(() => window.__laminaFixture.browserUrls ?? [])).toEqual([]);
+  await editor.getByRole('button', { name: '検証資料の資料詳細', exact: true }).click();
+  const detail = page.getByRole('complementary', { name: '資料の詳細', exact: true });
+  await detail.getByRole('button', { name: `${app}で開く`, exact: true }).click(); await expect.poll(calls).toHaveLength(2);
+  await detail.getByRole('button', { name: 'ブラウザで開く', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__laminaFixture.browserUrls)).toEqual([url]);
+  const files = await page.evaluate(() => window.__laminaFixture.files);
+  expect(files['メモ/試験の手順.md'].content).toContain(`(${url})`); expect(files['資料/検証資料.md'].content).toContain(url); expect(files['資料/検証資料.md'].content).not.toContain('ms-');
+  await page.getByRole('button', { name: '資料一覧', exact: true }).click(); await page.getByRole('button', { name: '検証資料を開く', exact: true }).click(); await expect.poll(calls).toHaveLength(3);
+  await page.getByRole('button', { name: '検証資料の詳細', exact: true }).click(); await detail.getByRole('button', { name: '資料ページ・詳しい説明を開く ↗', exact: true }).click();
+  await page.getByRole('button', { name: `${app}で開く`, exact: true }).click(); await expect.poll(calls).toHaveLength(4);
+  await page.getByRole('button', { name: 'ブラウザで開く', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__laminaFixture.browserUrls)).toEqual([url, url]);
+  await page.screenshot({ path: `.tools/qa/sharepoint-${kind}.png` });
+});
+
+test('不透明なSharePointリンクは登録済み種類を使い、Office起動失敗ではブラウザを勝手に開かない', async ({ page }) => {
+  const url = 'https://team.sharepoint.com/:u:/s/Dev/opaque?e=token';
+  const editor = await openMarkdown(page, `本文\n\n[仕様](${url})\n\n末尾`);
+  await page.evaluate(content => { window.__laminaFixture.files['資料/仕様.md'] = { content, revision: 'spec' }; }, writeMaterial({ ...materialDraft(url), title: '仕様', type: 'word' }));
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await editor.press('Control+Home'); await page.evaluate(() => { window.__laminaFixture.officeFailure = true; });
+  await editor.locator('a.cm-resource-link').click(); await expect(page.getByRole('alert')).toContainText('Officeデスクトップアプリ');
+  expect(await page.evaluate(() => window.__laminaFixture.resourceCalls)).toEqual([{ path: url, kind: 'word' }]); expect(await page.evaluate(() => window.__laminaFixture.browserUrls ?? [])).toEqual([]);
+  await editor.getByRole('button', { name: '仕様の資料詳細', exact: true }).click();
+  await page.getByRole('complementary', { name: '資料の詳細', exact: true }).getByRole('button', { name: 'ブラウザで開く', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__laminaFixture.browserUrls)).toEqual([url]);
+});
+
+test('通常のWebとSharePointのPDF・フォルダーはOfficeへ渡さない', async ({ page }) => {
+  const urls = ['https://example.com/report.xlsx', 'https://team.sharepoint.com/:b:/s/Dev/pdf', 'https://team.sharepoint.com/:f:/s/Dev/folder'];
+  const editor = await openMarkdown(page, '最初\n\n' + urls.map((url, i) => `[資料${i}](${url})`).join('\n') + '\n\n最後');
+  await expect(editor.locator('a.cm-preview-link')).toHaveCount(3);
+  for (const link of await editor.locator('a.cm-preview-link').all()) await link.click();
+  await expect.poll(() => page.evaluate(() => window.__laminaFixture.browserUrls)).toEqual(urls);
+  expect(await page.evaluate(() => window.__laminaFixture.resourceCalls ?? [])).toEqual([]);
+});
+
 test('資料：SharePointのURLとファイル名情報を保ち、登録済み資料とテーマを再利用する', async ({ page }) => {
   await connectTestVault(page); await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
   const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true }); await editor.press('Control+End');
@@ -1595,7 +1542,8 @@ test('[[ の候補から既存ノートを挿入し、クリックとバック�
   await expect(page.getByRole('textbox', { name: '耐久性評価の本文' })).toBeVisible();
   const backlinks = page.locator('.backlink-card');
   await expect(backlinks).toHaveCount(1);
-  await expect(backlinks.first()).toContainText('参照：[[耐久性評価]]');
+  await expect(backlinks.first()).toContainText('参照：耐久性評価');
+  await expect(backlinks.first().locator('.reference-current-line')).toContainText('参照：耐久性評価');
   await backlinks.first().click();
   await expect(editor).toBeVisible();
   await expect(editor).toBeFocused();
@@ -1674,10 +1622,137 @@ test('フォルダー移動とアプリ終了中の移動の両方に追従し�
   expect(await page.evaluate(() => window.__laminaFixture.files['メモ/整理/設計/参照先.md'].content)).toBe('参照先の本文');
 });
 
+test('日常品質：タブ切替と閉じて再開した後もUndo・Redoを保つ', async ({ page }) => {
+  const editor = await openMarkdown(page, '元の記録\n');
+  await editor.press('Control+End'); await page.keyboard.insertText('取り消す追記');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click({ modifiers: ['Control'] });
+  await page.getByRole('tab', { name: '試験の手順', exact: true }).click();
+  await editor.press('Control+z'); await expect(editor).not.toContainText('取り消す追記');
+  await editor.press('Control+Shift+z'); await expect(editor).toContainText('取り消す追記');
+  await editor.press('Control+w'); await page.keyboard.press('Control+Shift+t');
+  await expect(editor).toBeVisible(); await editor.press('Control+z'); await expect(editor).not.toContainText('取り消す追記');
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('元の記録\n');
+});
+
+test('日常品質：外部で更新されたノートに過去のUndoを適用しない', async ({ page }) => {
+  const editor = await openMarkdown(page, '元の記録\n'); await editor.press('Control+End'); await page.keyboard.insertText('追記'); await editor.press('Control+s');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click({ modifiers: ['Control'] });
+  await page.evaluate(() => { window.__laminaFixture.files['メモ/試験の手順.md'] = { content: '外部で変更した原文', revision: 'external-new' }; });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('tab', { name: '試験の手順', exact: true }).click(); await expect(editor).toContainText('外部で変更した原文');
+  await editor.press('Control+z'); await expect(editor).toHaveText('外部で変更した原文');
+});
+
+test('日常品質：資料一覧の条件・選択・表示位置をタブ移動と再起動で維持する', async ({ page }) => {
+  await connectTestVault(page); await seedMaterials(page); await page.getByRole('button', { name: '資料一覧', exact: true }).click();
+  const search = page.getByRole('textbox', { name: '資料を検索', exact: true }); await search.fill('評価');
+  await page.getByRole('combobox', { name: '資料の並べ替え', exact: true }).selectOption('title');
+  await page.getByRole('button', { name: '評価.xlsxの詳細', exact: true }).click(); await page.getByRole('checkbox', { name: '評価.xlsxを選択', exact: true }).check();
+  await page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true }).click({ modifiers: ['Control'] });
+  await page.getByRole('tab', { name: '資料一覧', exact: true }).click(); await expect(search).toHaveValue('評価');
+  await expect(page.getByRole('checkbox', { name: '評価.xlsxを選択', exact: true })).toBeChecked();
+  await expect(page.getByRole('complementary', { name: '資料の詳細', exact: true })).toContainText('評価.xlsx');
+  await page.keyboard.press('Control+s'); await page.reload(); await expect(search).toHaveValue('評価');
+  await expect(page.getByRole('combobox', { name: '資料の並べ替え', exact: true })).toHaveValue('title');
+  await expect(page.getByRole('checkbox', { name: '評価.xlsxを選択', exact: true })).toBeChecked();
+  await page.screenshot({ path: '.tools/qa/daily-materials.png' });
+});
+
+test('日常品質：フォルダー開閉とペイン幅をマウス・キーボードで調整して復元する', async ({ page }) => {
+  const editor = await openMarkdown(page, '本文\n');
+  await page.evaluate(() => { window.__laminaFixture.folders.push('メモ/整理'); window.__laminaFixture.files['メモ/整理/子.md'] = { content: '子メモ', revision: 'child' }; });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('button', { name: '整理', exact: true }).click(); await expect(page.getByRole('button', { name: '子', exact: true })).not.toBeVisible();
+  const left = page.getByRole('separator', { name: '左サイドバーの幅', exact: true });
+  const bounds = (await left.boundingBox())!; await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + 180); await page.mouse.down(); await page.mouse.move(bounds.x + 55, bounds.y + 180); await page.mouse.up();
+  const width = Number(await left.getAttribute('aria-valuenow')); expect(width).toBeGreaterThan(270);
+  const right = page.getByRole('separator', { name: '右サイドバーの幅', exact: true }); await right.focus(); await right.press('ArrowLeft'); await expect(right).toHaveAttribute('aria-valuenow', '310');
+  await page.getByRole('button', { name: '左右分割を切り替え', exact: true }).click();
+  const split = page.getByRole('separator', { name: '左右ペインの幅', exact: true }); await split.focus(); await split.press('ArrowRight');
+  await page.keyboard.press('Control+s'); await page.reload(); await expect(editor.first()).toBeVisible();
+  await expect(left).toHaveAttribute('aria-valuenow', String(width)); await expect(right).toHaveAttribute('aria-valuenow', '310');
+  await expect(split).toHaveAttribute('aria-valuenow', '0.52'); await expect(page.getByRole('button', { name: '子', exact: true })).not.toBeVisible();
+  await page.screenshot({ path: '.tools/qa/daily-split.png' });
+});
+
+test('日常品質：検索結果を上下キー・Enterで開き、抜粋に検索語を強調する', async ({ page }) => {
+  await connectTestVault(page); await page.getByRole('button', { name: '保管庫内を検索', exact: true }).click();
+  const input = page.getByRole('combobox', { name: '検索する文字列', exact: true }); await input.fill('確認');
+  await expect(page.getByRole('option')).toHaveCount(2); await expect(page.locator('.search-result mark')).toHaveCount(2);
+  await expect(input).toHaveAttribute('aria-activedescendant', 'search-result-0'); await input.press('ArrowDown'); await expect(input).toHaveAttribute('aria-activedescendant', 'search-result-1');
+  await input.press('ArrowUp'); await expect(input).toHaveAttribute('aria-activedescendant', 'search-result-0');
+  await page.screenshot({ path: '.tools/qa/daily-search.png' }); await input.press('Enter');
+  await expect(page.getByRole('dialog', { name: '保管庫内を検索', exact: true })).not.toBeVisible();
+  await expect(page.getByRole('textbox', { name: '耐久性評価の本文', exact: true })).toBeFocused();
+});
+
+test('日常品質：リンク失敗には起動の再試行を提示し、保存の再試行を表示しない', async ({ page }) => {
+  const editor = await openMarkdown(page, '本文\n\n[外部](https://example.com/report)\n\n末尾');
+  await page.evaluate(() => { window.__laminaFixture.openFailure = true; }); await editor.locator('a.cm-preview-link').click();
+  const notice = page.getByRole('alert'); await expect(notice.getByRole('button', { name: 'リンクを再度開く', exact: true })).toBeVisible();
+  await expect(notice.getByRole('button', { name: '保存を再試行', exact: true })).toHaveCount(0);
+  await page.evaluate(() => { window.__laminaFixture.openFailure = false; }); await notice.getByRole('button', { name: 'リンクを再度開く', exact: true }).click();
+  await expect(notice).not.toBeVisible(); expect(await page.evaluate(() => window.__laminaFixture.openedUrls)).toEqual(['https://example.com/report']);
+});
+
+test('日常品質：変更のない復帰は本文を再読込せず、監視通知は必ず内容を確認する', async ({ page }) => {
+  const editor = await openMarkdown(page, '本文\n'); await page.evaluate(() => { window.__laminaFixture.useCatalogStamp = true; });
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  const before = await page.evaluate(() => window.__laminaFixture.catalogReads!);
+  await editor.click(); await page.evaluate(() => window.dispatchEvent(new Event('focus'))); await page.clock.runFor(700);
+  expect(await page.evaluate(() => window.__laminaFixture.catalogReads)).toBe(before); expect(await page.evaluate(() => window.__laminaFixture.stampReads)).toBeGreaterThan(0);
+  await page.evaluate(() => window.__laminaChanged()); await page.clock.runFor(500);
+  expect(await page.evaluate(() => window.__laminaFixture.catalogReads!)).toBeGreaterThan(before); await expect(editor).toBeFocused();
+});
+
+for (const scale of [1, 1.25, 1.5]) test(`日常品質：表示倍率${scale * 100}％相当で文字と操作領域を確保する`, async ({ browser }) => {
+  const context = await browser.newContext({ baseURL: 'http://127.0.0.1:1420', timezoneId: 'Asia/Tokyo', viewport: { width: Math.round(1280 / scale), height: Math.round(860 / scale) }, deviceScaleFactor: scale });
+  const page = await context.newPage();
+  try {
+    const editor = await openMarkdown(page, '# 記録\n\n- 試験条件を確認する\n- [ ] 測定結果をまとめる\n\n本文を読みやすく表示します。');
+    await expect(editor).toHaveCSS('font-size', '16px');
+    const windowWidth = page.viewportSize()!.width;
+    const controls = await page.locator('.toolbar-actions button').evaluateAll(elements => elements.map(element => { const rect = element.getBoundingClientRect(); return { left: rect.left, right: rect.right, height: rect.height }; }).filter(rect => rect.height > 0));
+    expect(controls.every(control => control.left >= 0 && control.right <= windowWidth + 1 && control.height >= 28), '操作ボタンがウィンドウ内に収まる').toBeTruthy();
+    await page.screenshot({ path: `.tools/qa/daily-scale-${scale}.png` });
+  } finally { await context.close(); }
+});
+
+test('日常品質：資料の長い一覧で縦横の表示位置を戻し、メモを複数行で読める', async ({ page }) => {
+  await connectTestVault(page);
+  const files = Array.from({ length: 60 }, (_, index) => [`資料/資料${index}.md`, writeMaterial({ ...materialDraft(`C:/試験/資料${index}.xlsx`), title: `資料${index}`, memo: '条件と結果を記録する。\n次回の確認事項。' })]);
+  await page.evaluate(files => { for (const [path, content] of files) window.__laminaFixture.files[path] = { content, revision: path }; }, files);
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', '');
+  await page.getByRole('button', { name: '資料一覧', exact: true }).click(); await page.getByRole('button', { name: '資料0の詳細', exact: true }).click();
+  const scroller = page.locator('.material-table-scroll'); await scroller.evaluate(element => { element.scrollTop = 650; element.scrollLeft = 120; });
+  await page.clock.runFor(250);
+  const saved = await scroller.evaluate(element => ({ top: element.scrollTop, left: element.scrollLeft })); expect(saved.top).toBeGreaterThan(500); expect(saved.left).toBeGreaterThan(0);
+  await page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true }).click({ modifiers: ['Control'] });
+  await page.getByRole('tab', { name: '資料一覧', exact: true }).click();
+  await expect.poll(() => scroller.evaluate(element => ({ top: element.scrollTop, left: element.scrollLeft }))).toEqual(saved);
+  await page.keyboard.press('Control+s'); await page.reload();
+  await expect.poll(() => scroller.evaluate(element => ({ top: element.scrollTop, left: element.scrollLeft }))).toEqual(saved);
+  await expect(page.locator('textarea.material-cell-input').first()).toHaveValue('条件と結果を記録する。\n次回の確認事項。');
+});
+
+test('日常品質：箇条書き・タスク・日本語を連続編集し、別タブ後も元の原文へ戻せる', async ({ page }) => {
+  const original = '# 記録\n\n- 親項目\n    - 子項目\n- [ ] 確認事項\n\n末尾';
+  const editor = await openMarkdown(page, original);
+  await editor.press('Control+Home'); await editor.press('ArrowDown'); await editor.press('ArrowDown'); await editor.press('End');
+  await editor.press('Enter'); await page.keyboard.insertText('追加項目'); await editor.press('Tab'); await editor.press('Shift+Tab'); await editor.press('Alt+ArrowUp'); await editor.press('Alt+ArrowDown');
+  await editor.press('Control+End'); await editor.press('Control+l'); await editor.press('Control+l'); await editor.press('Enter'); await page.keyboard.insertText('日本語の追記');
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click({ modifiers: ['Control'] });
+  await page.getByRole('tab', { name: '試験の手順', exact: true }).click();
+  for (let index = 0; index < 18; index++) await editor.press('Control+z');
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe(original);
+});
+
 test('全文検索で日付と周辺文章を確認して該当行へ移動する', async ({ page }) => {
   await connectTestVault(page);
   await page.getByRole('button', { name: '保管庫内を検索' }).click();
-  await page.getByRole('textbox', { name: '検索する文字列' }).fill('温度推移');
+  await page.getByRole('combobox', { name: '検索する文字列' }).fill('温度推移');
   await expect(page.locator('.search-result')).toHaveCount(1);
   await expect(page.locator('.search-result')).toContainText('2026-11-11');
   await page.locator('.search-result').click();

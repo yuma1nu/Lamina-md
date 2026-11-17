@@ -4,14 +4,14 @@ import { markdownDestination } from './markdown';
 import { imageMarkup, imagePath, imageReferences } from './images';
 
 export interface PathMove { from: string; to: string }
-export interface Catalog { snapshot: VaultSnapshot; files: DiskFile[]; moves: PathMove[]; previous: { path: string; kind: string }[]; warnings: string[] }
+export interface Catalog { stamp?: string | null; snapshot: VaultSnapshot; files: DiskFile[]; moves: PathMove[]; previous: { path: string; kind: string }[]; warnings: string[] }
 export interface FileWrite { path: string; content: string; expectedRevision: string | null }
 export interface Operation { relocation?: PathMove; writes: FileWrite[]; guards: { path: string; revision: string }[]; folders?: string[]; deletes?: { path: string; revision: string }[]; acceptMoves?: boolean }
 export interface NoteTarget { id: string; name: string; kind: 'theme' | 'note' | 'material'; files: string[] }
 export interface NoteReference { from: number; to: number; targetFrom: number; targetTo: number; target: string; syntax: 'wiki' | 'markdown'; alias?: string; labelFrom: number; labelTo: number; reference?: string; shortcut?: boolean }
 export interface NoteIndex { targets: NoteTarget[]; files: Map<string, SourceFile> }
 export interface ResolvedLink { target?: NoteTarget; fragment: string; path?: string; offset: number; ambiguous: boolean; missingHeading: boolean }
-export interface ReferenceHit { source: NoteTarget; path: string; from: number; line: number; date?: string; context: string; fragment: string }
+export interface ReferenceHit { source: NoteTarget; path: string; from: number; line: number; date?: string; context: string; contextLine?: number; fragment: string }
 
 export function mapPath(path: string, moves: PathMove[]): string {
   const movement = moves.filter(move => path === move.from || path.startsWith(move.from + '/')).sort((a, b) => b.from.length - a.from.length)[0];
@@ -52,8 +52,11 @@ function tree(path: string, content: string) {
 }
 const destination = markdownDestination;
 const labelKey = (value: string) => value.slice(1, -1).replace(/\s+/g, ' ').trim().toLowerCase();
+const referenceCache = new WeakMap<ReturnType<typeof tree>, Map<boolean, NoteReference[]>>();
 export function noteReferences(path: string, content: string, includeExternal = false): NoteReference[] {
-  const syntax = tree(path, content), blocked: { from: number; to: number }[] = [], definitions = new Map<string, { from: number; to: number; target: string }>();
+  const syntax = tree(path, content);
+  const cached = referenceCache.get(syntax)?.get(includeExternal); if (cached) return cached.slice();
+  const blocked: { from: number; to: number }[] = [], definitions = new Map<string, { from: number; to: number; target: string }>();
   const yaml = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/.exec(content);
   if (yaml) blocked.push({ from: 0, to: yaml[0].length });
   syntax.iterate({ enter(node) {
@@ -90,7 +93,9 @@ export function noteReferences(path: string, content: string, includeExternal = 
     if (!target) continue;
     references.push({ from, to, targetFrom: from + 2, targetTo: from + 2 + (pipe < 0 ? match[1].length : pipe), target, syntax: 'wiki', ...(pipe < 0 ? {} : { alias: match[1].slice(pipe + 1) }), labelFrom: pipe < 0 ? from + 2 : from + 3 + pipe, labelTo: to - 2 });
   }
-  return references.sort((a, b) => a.from - b.from);
+  references.sort((a, b) => a.from - b.from);
+  let cache = referenceCache.get(syntax); if (!cache) { cache = new Map(); referenceCache.set(syntax, cache); } cache.set(includeExternal, references);
+  return references.slice();
 }
 export function isMarkupPosition(path: string, content: string, position: number): boolean {
   let blocked = false;
@@ -143,25 +148,42 @@ export function movedSnapshot(snapshot: VaultSnapshot, moves: PathMove[]): Vault
   const entries = (items: VaultSnapshot['notes']) => items.map(note => { const path = mapPath(note.path, moves); return { path, name: path.split('/').at(-1)! }; });
   return { ...snapshot, themes: snapshot.themes.map(theme => { const path = mapPath(theme.path, moves); return { ...theme, path, name: path.split('/').at(-1)!, files: theme.files.map(file => ({ ...file, path: mapPath(file.path, moves), name: mapPath(file.path, moves).split('/').at(-1)! })) }; }), notes: entries(snapshot.notes), materials: entries(snapshot.materials ?? []) };
 }
+export function referenceContext(content: string, line: number) {
+  const start = Math.max(0, line - 2), lines = content.split('\n').slice(start, line + 1);
+  let contextLine = line - 1 - start;
+  while (lines.length > 1 && !lines[0].trim()) { lines.shift(); contextLine--; }
+  while (lines.length > 1 && !lines.at(-1)!.trim()) lines.pop();
+  return { context: lines.join('\n').trim(), contextLine: Math.max(0, contextLine) };
+}
+const owners = new WeakMap<NoteIndex, Map<string, NoteTarget>>();
+function owner(index: NoteIndex, path: string) {
+  let map = owners.get(index); if (!map) { map = new Map(index.targets.flatMap(target => target.files.map(path => [path, target] as const))); owners.set(index, map); } return map.get(path);
+}
+const backlinkCache = new WeakMap<NoteIndex, Map<string, ReferenceHit[]>>();
+const searchCache = new WeakMap<NoteIndex, Map<string, ReferenceHit[]>>();
 export function referenceHits(index: NoteIndex, targetId: string): ReferenceHit[] {
+  let cache = backlinkCache.get(index); if (!cache) { cache = new Map(); backlinkCache.set(index, cache); }
+  const saved = cache.get(targetId); if (saved) return saved;
   const results: ReferenceHit[] = [];
   for (const [path, file] of index.files) {
-    const source = index.targets.find(target => target.files.includes(path)); if (!source) continue;
+    const source = owner(index, path); if (!source) continue;
     const dates = dateHeadings(file.content);
     for (const ref of noteReferences(path, file.content)) {
       const resolved = resolveNote(index, ref.target, path, ref.syntax);
       if (resolved.target?.id !== targetId || resolved.missingHeading) continue;
       const before = file.content.slice(0, ref.from), line = before.split('\n').length;
-      results.push({ source, path, from: ref.from, line, date: dates.filter(date => date.from <= ref.from).at(-1)?.date, context: file.content.split('\n').slice(Math.max(0, line - 2), line + 1).join('\n').trim(), fragment: resolved.fragment });
+      results.push({ source, path, from: ref.from, line, date: dates.filter(date => date.from <= ref.from).at(-1)?.date, ...referenceContext(file.content, line), fragment: resolved.fragment });
     }
   }
-  return results;
+  cache.set(targetId, results); return results;
 }
 export function searchNotes(index: NoteIndex, query: string): ReferenceHit[] {
   const needle = query.trim().toLowerCase(); if (!needle) return [];
+  let cache = searchCache.get(index); if (!cache) { cache = new Map(); searchCache.set(index, cache); }
+  const saved = cache.get(needle); if (saved) return saved;
   const results: ReferenceHit[] = [];
   for (const [path, file] of index.files) {
-    const source = index.targets.find(target => target.files.includes(path)); if (!source) continue;
+    const source = owner(index, path); if (!source) continue;
     const dates = dateHeadings(file.content); let offset = 0;
     file.content.split('\n').forEach((text, line) => {
       const position = text.toLowerCase().indexOf(needle);
@@ -169,7 +191,7 @@ export function searchNotes(index: NoteIndex, query: string): ReferenceHit[] {
       offset += text.length + 1;
     });
   }
-  return results;
+  cache.set(needle, results); if (cache.size > 20) cache.delete(cache.keys().next().value!); return results;
 }
 export function rewriteLinks(before: NoteIndex, after: NoteIndex, moves: PathMove[], files: Map<string, SourceFile>, alreadyMoved = false): FileWrite[] {
   const inverse = moves.map(move => ({ from: move.to, to: move.from }));

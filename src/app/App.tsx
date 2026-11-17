@@ -1,5 +1,9 @@
-import { lazy, Suspense, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Layers, FolderOpen, FolderPlus, Plus, NotebookPen, FileText, PanelLeftClose, PanelRight, Columns2, CalendarDays, Pin, PinOff, X, Search, ChevronRight, AlertCircle, RotateCw, ArrowUpRight, Database } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
+import { useCompactLayout } from '../ui/use-compact-layout';
+import { ResizeHandle } from '../ui/ResizeHandle';
+import { ErrorNotification } from '../ui/ErrorNotification';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { Layers, FolderOpen, FolderPlus, Plus, NotebookPen, FileText, PanelLeftClose, PanelRight, Columns2, CalendarDays, Pin, PinOff, X, Search, ChevronRight, ArrowUpRight, Database } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { listen } from '@tauri-apps/api/event';
 import { chooseVault, isDesktop } from '../platform/desktop';
@@ -14,8 +18,11 @@ const MarkdownEditor = lazy(() => import('../features/editor/MarkdownEditor').th
 
 
 export function App() {
-  const state = useWorkspace(), [query, setQuery] = useState('');
+  const state = useWorkspace(useShallow(({ views: _views, preferences: _preferences, selectionText: _selection, ...state }) => state)), [query, setQuery] = useState('');
   const sidebar = state.sidebar;
+  const compact = useCompactLayout(), inspectorNarrow = useWorkspace(state => state.preferences.inspectorNarrow);
+  const showInspector = state.outline && (!compact || inspectorNarrow);
+  const sidebarWidth = useWorkspace(state => state.preferences.sidebarWidth), inspectorWidth = useWorkspace(state => state.preferences.inspectorWidth), splitRatio = useWorkspace(state => state.preferences.splitRatio);
   const [creation, setCreation] = useState<'theme' | 'note' | null>(null), [name, setName] = useState(''), [creating, setCreating] = useState(false);
   const [editRequest, setEditRequest] = useState<EditRequest | null>(null);
   const modal = useRef<HTMLDialogElement>(null);
@@ -52,7 +59,7 @@ export function App() {
     };
     window.addEventListener('beforeunload', beforeUnload);
     let focusTimer: ReturnType<typeof setTimeout> | undefined;
-    const focus = () => { clearTimeout(focusTimer); focusTimer = setTimeout(() => { if (!choosingVault.current && useWorkspace.getState().vault && !useWorkspace.getState().annotationOpen) void workspace.refresh(); }, 200); };
+    const focus = () => { clearTimeout(focusTimer); focusTimer = setTimeout(() => { if (!choosingVault.current && useWorkspace.getState().vault && !useWorkspace.getState().annotationOpen) workspace.requestExternalRefresh(false); }, 200); };
     window.addEventListener('focus', focus);
     let disposed = false, unlisten: (() => void) | undefined;
     if (isDesktop()) void getCurrentWindow().onCloseRequested(async event => {
@@ -66,7 +73,7 @@ export function App() {
   useEffect(() => { focusActiveEditor(); }, [state.activePane, state.panes[0].active, state.panes[1].active]);
   useEffect(() => {
     if (creation && !modal.current?.open) modal.current?.showModal();
-    if (!creation && modal.current?.open) modal.current?.close();
+    if (!creation && modal.current?.open) { modal.current.close(); focusActiveEditor(); }
   }, [creation]);
   async function create(event: FormEvent) {
     event.preventDefault();
@@ -77,9 +84,9 @@ export function App() {
     if (ok) { setCreation(null); setName(''); }
   }
   function beginCreate(kind: 'theme' | 'note') { setName(''); setCreation(kind); }
-  const filteredThemes = state.vault?.themes.filter(t => t.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [];
-  const filteredNotes = state.vault?.notes.filter(n => n.path.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [];
-  return <div className={`app-shell ${sidebar ? '' : 'sidebar-hidden'} ${state.outline && active && active.kind !== 'materials' ? '' : 'outline-hidden'} ${state.outline && detail ? 'material-inspector' : ''}`} inert={state.busy || state.closing} aria-busy={state.busy || state.closing}>
+  const filteredThemes = useMemo(() => state.vault?.themes.filter(t => t.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [], [state.vault, query]);
+  const filteredNotes = useMemo(() => state.vault?.notes.filter(n => n.path.toLocaleLowerCase().includes(query.toLocaleLowerCase())) ?? [], [state.vault, query]);
+  return <div style={{ '--sidebar-width': `${sidebarWidth}px`, '--inspector-width': `${inspectorWidth}px`, '--split-left': `${splitRatio * 100}%` } as import('react').CSSProperties} className={`app-shell ${state.split ? 'is-split' : ''} ${sidebar ? '' : 'sidebar-hidden'} ${showInspector && active && active.kind !== 'materials' ? '' : 'outline-hidden'} ${showInspector && detail ? 'material-inspector' : ''}`} inert={state.busy || state.closing} aria-busy={state.busy || state.closing}>
     {sidebar && <aside className="sidebar">
       <div className="brand"><Layers size={21} strokeWidth={1.6} /><span>Lamina<span className="brand-suffix">.md</span></span></div>
       {state.vault ? <>
@@ -97,25 +104,28 @@ export function App() {
       </> : <div className="sidebar-intro"><p>考えたことを、<br />次の知見へ。</p><span>日々の記録を重ねる場所。</span></div>}
       <div className="sidebar-footer"><button onClick={() => void selectVault(false)} disabled={state.busy}><FolderOpen size={15} />保管庫を開く</button><span>個人の技術ノート</span></div>
     </aside>}
+    {sidebar && <ResizeHandle kind="sidebar" />}
     <main className="main-column">
       <header className="workspace-toolbar">
-        <div className="breadcrumb"><button className="icon-button" aria-label={sidebar ? 'サイドバーを閉じる' : 'サイドバーを開く'} onClick={() => useWorkspace.setState({ sidebar: !sidebar })}><PanelLeftClose size={17} /></button><span>{active ? active.kind === 'theme' ? 'テーマ' : active.kind === 'note' ? 'メモ' : '資料' : 'Lamina.md'}</span>{active && <><ChevronRight size={12} /><strong>{active.label}</strong></>}</div>
-        <div className="toolbar-actions">{state.vault && <WorkspaceTools onEdit={setEditRequest} />}{active?.kind === 'theme' && <button className="today-button" onClick={() => workspace.today(active.id)}><CalendarDays size={15} />今日へ</button>}{active && <>{active.kind !== 'materials' && <ItemActions path={active.id} onEdit={setEditRequest} />}<button className="icon-button" aria-label="左右分割を切り替え" title="左右分割" aria-pressed={state.split} onClick={() => workspace.toggleSplit()}><Columns2 size={17} /></button><button className="icon-button" aria-label="右サイドバーを切り替え" title="バックリンク・目次" aria-pressed={state.outline} onClick={() => useWorkspace.setState({ outline: !state.outline })}><PanelRight size={17} /></button></>}</div>
+        <div className="breadcrumb"><button className="icon-button" aria-label={sidebar ? 'サイドバーを閉じる' : 'サイドバーを開く'} title={sidebar ? 'サイドバーを閉じる' : 'サイドバーを開く'} onClick={() => useWorkspace.setState({ sidebar: !sidebar })}><PanelLeftClose size={17} /></button><span>{active ? active.kind === 'theme' ? 'テーマ' : active.kind === 'note' ? 'メモ' : '資料' : 'Lamina.md'}</span>{active && <><ChevronRight size={12} /><strong>{active.label}</strong></>}</div>
+        <div className="toolbar-actions">{state.vault && <WorkspaceTools onEdit={setEditRequest} />}{active?.kind === 'theme' && <button className="today-button" onClick={() => workspace.today(active.id)}><CalendarDays size={15} />今日へ</button>}{active && <>{active.kind !== 'materials' && <ItemActions path={active.id} onEdit={setEditRequest} />}<button className="icon-button" aria-label="左右分割を切り替え" title="左右分割" aria-pressed={state.split} onClick={() => workspace.toggleSplit()}><Columns2 size={17} /></button><button className="icon-button" aria-label="右サイドバーを切り替え" title="バックリンク・目次" aria-pressed={showInspector} onClick={() => { if (compact) { useWorkspace.setState({ outline: true }); workspace.updatePreferences({ inspectorNarrow: !showInspector }); } else useWorkspace.setState({ outline: !state.outline }); }}><PanelRight size={17} /></button></>}</div>
       </header>
       <div className={`panes ${state.split ? 'split' : ''}`}>
+        {state.split && <ResizeHandle kind="split" />}
         {([0, 1] as const).filter(p => p === 0 || state.split).map(pane => {
           const group = state.panes[pane], document = group.active ? state.documents[group.active] : null;
           return <section className={`pane ${state.activePane === pane ? 'active-pane' : ''}`} key={pane} aria-label={pane ? '右ペイン' : '左ペイン'} onPointerDown={() => workspace.activate(pane)}>
-            {!!group.tabs.length && <div className="tab-strip" role="tablist" aria-label={pane ? '右ペインのタブ' : '左ペインのタブ'}>{group.tabs.map(tab => <div className={`tab ${group.active === tab.id ? 'active' : ''}`} key={tab.id}><button className="tab-title" role="tab" aria-selected={group.active === tab.id} onClick={() => workspace.activate(pane, tab.id)}>{state.documents[tab.id]?.label}</button><button className={`tab-action ${tab.pinned ? 'pinned' : ''}`} aria-label={tab.pinned ? 'ピン留めを解除' : 'ピン留め'} title={tab.pinned ? 'ピン留めを解除' : 'ピン留め'} onClick={() => workspace.togglePin(pane, tab.id)}>{tab.pinned ? <Pin size={12} /> : <PinOff size={12} />}</button><button className="tab-action" aria-label={`${state.documents[tab.id]?.label}を閉じる`} title="タブを閉じる" onClick={() => void workspace.closeTab(pane, tab.id)}><X size={13} /></button></div>)}</div>}
+            {!!group.tabs.length && <div className="tab-strip" role="tablist" aria-label={pane ? '右ペインのタブ' : '左ペインのタブ'}>{group.tabs.map(tab => <div className={`tab ${group.active === tab.id ? 'active' : ''}`} key={tab.id}><button className="tab-title" role="tab" aria-selected={group.active === tab.id} onClick={() => workspace.activate(pane, tab.id)}>{state.documents[tab.id]?.label}</button><button className={`tab-action ${tab.pinned ? 'pinned' : ''}`} aria-label={tab.pinned ? 'ピン留めを解除' : 'ピン留め'} title={tab.pinned ? 'ピン留めを解除' : 'ピン留め'} onClick={() => workspace.togglePin(pane, tab.id)}>{tab.pinned ? <Pin size={12} /> : <PinOff size={12} />}</button><button className="tab-action" aria-label={`${state.documents[tab.id]?.label}を閉じる`} title="タブを閉じる（Ctrl+W）" onClick={() => void workspace.closeTab(pane, tab.id)}><X size={13} /></button></div>)}</div>}
             {document?.kind === 'materials' ? <MaterialsView pane={pane} /> : document?.kind === 'material' ? <MaterialPage document={document} pane={pane} jump={state.activePane === pane && state.jump?.id === document.id ? state.jump : null} /> : document ? <div className="document-container"><div className="document-heading"><span className="document-kicker">{document.kind === 'theme' ? 'テーマの記録' : 'メモ'}</span><h1>{document.label}</h1></div>{document.files.length ? <Suspense fallback={<p className="editor-loading">ノートを開いています…</p>}><MarkdownEditor key={document.id} document={document} pane={pane} jump={state.activePane === pane && state.jump?.id === document.id ? state.jump : null} /></Suspense> : <div className="empty-theme"><p>このテーマには、まだ記録がありません。</p><button className="button primary" onClick={() => workspace.today(document.id)}><CalendarDays size={16} />今日の記録を始める</button></div>}</div> : state.vault ? <div className="empty-pane"><Layers size={36} strokeWidth={1} /><h2>記録をひらく</h2><p>テーマやメモを選んで、続きを書きましょう。</p><div className="welcome-actions"><button className="button" onClick={() => beginCreate('theme')}><Plus size={15} />テーマを作る</button><button className="button" onClick={() => beginCreate('note')}><FileText size={15} />メモを作る</button></div></div> : <div className="welcome"><div className="welcome-mark"><Layers size={35} strokeWidth={1.25} /></div><span className="eyebrow">YOUR WORK, LAYER BY LAYER</span><h1>Lamina<span>.md</span></h1><p>今日の試行を、明日の知見に。</p><div className="welcome-actions"><button className="button primary" onClick={() => void selectVault(false)} disabled={state.busy}><FolderOpen size={17} />保管庫を開く</button><button className="button" onClick={() => void selectVault(true)} disabled={state.busy}><FolderPlus size={17} />新しい保管庫を作る</button></div>{recent && isDesktop() && <button className="recent-vault" onClick={() => void workspace.openVault(recent)}><span>前回の保管庫</span><span>{recent.split(/[\\/]/).filter(Boolean).at(-1)}</span><ArrowUpRight size={13} /></button>}<div className="welcome-caption">Markdownを、自分のフォルダーに。</div></div>}
           </section>;
         })}
       </div>
     </main>
-    {state.outline && active && active.kind !== 'materials' && (detail ? <MaterialDetail material={detail} pane={state.activePane} className="material-inspector-panel" close={() => { useWorkspace.setState({ materialDetail: null }); focusActiveEditor(); }} /> : <Inspector document={active} />)}
+    {showInspector && active && active.kind !== 'materials' && (detail ? <MaterialDetail material={detail} pane={state.activePane} className="material-inspector-panel" close={() => { useWorkspace.setState({ materialDetail: null }); if (compact) workspace.updatePreferences({ inspectorNarrow: false }); focusActiveEditor(); }} /> : <Inspector document={active} />)}
+    {showInspector && active && active.kind !== 'materials' && <ResizeHandle kind="inspector" />}
     <MaterialDialog />
     <WorkspaceDialog request={editRequest} close={() => setEditRequest(null)} />
-    {state.error && <div className="error-message" role="alert"><AlertCircle size={18} /><div><strong>操作を完了できませんでした</strong><p>{state.error}</p></div>{state.vault && <button className="icon-button" aria-label="保存を再試行" title="保存を再試行" onClick={() => void workspace.flush().catch(() => {})}><RotateCw size={17} /></button>}<button className="icon-button" aria-label="通知を閉じる" onClick={() => useWorkspace.setState({ error: null })}><X size={17} /></button></div>}
+    <ErrorNotification />
     <dialog ref={modal} className="create-dialog" onCancel={() => setCreation(null)} onClose={() => setCreation(null)} aria-labelledby="create-title"><form onSubmit={event => void create(event)}><div className="dialog-heading"><h2 id="create-title">{creation === 'theme' ? '新しいテーマ' : '新しいメモ'}</h2><button type="button" className="icon-button" aria-label="閉じる" onClick={() => setCreation(null)} disabled={creating}><X size={18} /></button></div><label>{creation === 'theme' ? 'テーマ名' : 'タイトル'}<input autoFocus value={name} onChange={event => setName(event.target.value)} placeholder={creation === 'theme' ? '例：軸受の耐久性評価' : '例：潤滑条件の選定'} maxLength={100} disabled={creating} /></label><p>{creation === 'theme' ? '月ごとのMarkdownを、一続きの記録として扱います。' : 'Markdownファイルとして、メモフォルダーに保存します。'}</p><footer><button type="button" className="button" onClick={() => setCreation(null)} disabled={creating}>キャンセル</button><button className="button primary" disabled={!name.trim() || creating}>作成</button></footer></form></dialog>
   </div>;
 }

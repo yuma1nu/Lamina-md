@@ -7,6 +7,18 @@ import { sourceFilesEffect, sourceFilesField } from './source-model';
 const file = (path: string, content: string) => fromDisk({ path, content, revision: path });
 
 describe('元のMarkdownとライブプレビュー', () => {
+  it('同じ行のカーソル移動はプレビューを再構築せず、別月の移動では非対象月の装飾を再利用する', () => {
+    const files = [file('テーマ/試験/2026-10.md', '**先月**\n\n本文'), file('テーマ/試験/2026-11.md', '**今月**\n\n本文')];
+    let state = EditorState.create({ doc: compose(files).text, selection: { anchor: 2 }, extensions: [sourceFilesField.init(() => files), livePreview] });
+    const first = state.field(livePreview);
+    state = state.update({ selection: { anchor: 3 } }).state;
+    expect(state.field(livePreview)).toBe(first);
+    const next = compose(files).segments[1].from;
+    state = state.update({ selection: { anchor: next } }).state;
+    const second = state.field(livePreview);
+    state = state.update({ selection: { anchor: state.doc.length } }).state;
+    expect(state.field(livePreview).sources[0].ranges).toBe(second.sources[0].ranges);
+  });
   it('未完了のコードブロックと参照定義を翌月のプレビューに持ち越さない', () => {
     const files = [file('テーマ/試験/2026-10.md', '[ref]: https://example.com\n\n```ts\n**literal**'), file('テーマ/試験/2026-11.md', '# 2026-11-12\n\n**今月** と [ref]\n\n末尾')];
     const { text, segments } = compose(files);

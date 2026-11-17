@@ -4,6 +4,7 @@ import { insertNewlineAndIndent, moveLineDown, moveLineUp } from '@codemirror/co
 import { ensureSyntaxTree, indentUnit } from '@codemirror/language';
 import { compose, type TextChange } from '../../domain/documents';
 import { sourceFilesField } from './source-model';
+import { taskMarker } from './task-list';
 
 // A theme is displayed continuously, but Markdown constructs and list commands
 // belong to each physical file. An unclosed fence must not change next month.
@@ -38,7 +39,29 @@ function withinSource(command: StateCommand): StateCommand {
 }
 
 const continueMarkup = insertNewlineContinueMarkupCommand({ nonTightLists: false });
-export const markdownEnter = withinSource(target => continueMarkup(target) || insertNewlineAndIndent(target));
+export const markdownEnter = withinSource(target => {
+  const { state, dispatch } = target, item = currentListItem(state);
+  const task = item && item.node.parent?.name === 'OrderedList' ? taskMarker(state.doc.toString(), item.node.getChild('ListMark')!.to) : null;
+  if (!item || !task) return continueMarkup(target) || insertNewlineAndIndent(target);
+  const empty = !item.line.text.slice(task.bodyFrom - item.line.from).trim();
+  const parent = item.node.parent?.parent?.getChild('ListMark');
+  const keepTask = !empty || !!(parent && taskMarker(state.doc.toString(), parent.to));
+  // CodeMirror's numbered-list continuation handles renumbering but does not
+  // include task markers. Let it do the structural work, then add the checkbox.
+  // On an empty task, first expose the empty numeric marker so Enter can exit.
+  const cleared = empty ? state.update({ changes: { from: task.checkFrom - 1, to: task.bodyFrom, insert: '' }, selection: { anchor: task.checkFrom - 1 } }) : null;
+  const local = { state: cleared?.state ?? state, dispatch: (transaction: Transaction) => {
+    let changes = cleared ? cleared.changes.compose(transaction.changes) : transaction.changes;
+    let selection = transaction.state.selection;
+    const line = transaction.state.doc.lineAt(selection.main.head), prefix = line.text.slice(0, selection.main.head - line.from);
+    if (keepTask && /^(?:[ \t]*>[ \t]?)*[ \t]*\d+[.)][ \t]+$/.test(prefix)) {
+      const checkbox = transaction.state.update({ changes: { from: selection.main.head, insert: '[ ] ' }, selection: { anchor: selection.main.head + 4 } });
+      changes = changes.compose(checkbox.changes); selection = checkbox.state.selection;
+    }
+    dispatch(state.update({ changes, selection, scrollIntoView: true, userEvent: 'input' }));
+  } };
+  return continueMarkup(local) || insertNewlineAndIndent(local);
+});
 export const markdownBackspace = withinSource(target => {
   const item = currentListItem(target.state);
   if (item && item.node.parent?.parent?.name === 'ListItem' && target.state.selection.main.head === item.line.from + item.contentFrom) return listIndent(target, false);

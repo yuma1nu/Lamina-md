@@ -14,6 +14,12 @@ function editor(marked: string) {
 }
 
 describe('箇条書きの構造を保つ入力', () => {
+  it('番号付きタスクは未完了で継続し、空項目で終了・親へ戻る', () => {
+    const edit = editor('1. [x] 確認|'); edit.run(markdownEnter); expect(edit.text()).toBe('1. [x] 確認\n2. [ ] ');
+    edit.run(markdownEnter); expect(edit.text()).toBe('1. [x] 確認\n');
+    const nested = editor('1. [x] 親\n    1. [ ] |'); nested.run(markdownEnter); expect(nested.text()).toBe('1. [x] 親\n2. [ ] ');
+    const split = editor('1. [ ] 前|後'); split.run(markdownEnter); expect(split.text()).toBe('1. [ ] 前\n2. [ ] 後');
+  });
   it('長い月次記録の末尾でもEnterの補完を継続する', () => {
     const prefix = '# 2026-11-01\n\n' + '実験条件と結果を記録する。\n\n'.repeat(800);
     const edit = editor(prefix + '- 今回の結果|');

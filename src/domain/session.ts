@@ -1,3 +1,4 @@
+import { readPreferences, type WorkspacePreferences } from './workspace-preferences';
 import { compose, type SourceFile } from './documents';
 
 export interface FilePosition { path: string; offset: number }
@@ -11,6 +12,7 @@ export interface WorkspaceSession {
   split: boolean;
   outline: boolean;
   sidebar: boolean;
+  preferences?: WorkspacePreferences;
   inspector?: 'outline' | 'backlinks';
 }
 
@@ -47,5 +49,5 @@ export function readSession(value: unknown): WorkspaceSession | null {
     }
     return { tabs, active: tabs.some(t => t.id === pane.active) ? pane.active as string : tabs[0]?.id ?? null };
   }) as WorkspaceSession['panes'];
-  return { version: 1, panes, activePane: value.split === true && value.activePane === 1 ? 1 : 0, split: value.split === true, outline: value.outline !== false, sidebar: value.sidebar !== false, inspector: value.inspector === 'outline' ? 'outline' : 'backlinks' };
+  return { version: 1, preferences: readPreferences(value.preferences), panes, activePane: value.split === true && value.activePane === 1 ? 1 : 0, split: value.split === true, outline: value.outline !== false, sidebar: value.sidebar !== false, inspector: value.inspector === 'outline' ? 'outline' : 'backlinks' };
 }

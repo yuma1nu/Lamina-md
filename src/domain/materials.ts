@@ -1,7 +1,8 @@
 import { isMap, parseDocument, Scalar } from 'yaml';
 import { dateHeadings, localDate, serializeFile, type SourceFile, type TextChange } from './documents';
-import { noteReferences, type FileWrite, type NoteIndex, type ReferenceHit } from './note-links';
+import { referenceContext, noteReferences, type FileWrite, type NoteIndex, type ReferenceHit } from './note-links';
 import { markdownDestination } from './markdown';
+import { sharePointOfficeType } from './sharepoint';
 
 export const materialTypes = { excel: 'Excel', pdf: 'PDF', word: 'Word', powerpoint: 'PowerPoint', folder: 'フォルダー', web: 'Webページ', file: 'ファイル' } as const;
 export interface MaterialProperties { title: string; type: string; path: string; added: string; memo: string; themes: string[] }
@@ -18,7 +19,7 @@ export function location(raw: string): { path: string; key: string; href: string
     const href = url.href.replace(/[()]/g, char => char === '(' ? '%28' : '%29');
     const leaf = decode(url.pathname.split('/').filter(Boolean).at(-1) ?? '');
     const name = /\.[a-z\d]{1,8}$/i.test(leaf) ? leaf : url.hostname;
-    return { path, key: 'web:' + href, href, web: true, name, type: inferType(leaf, 'web') };
+    return { path, key: 'web:' + href, href, web: true, name, type: sharePointOfficeType(path) ?? inferType(leaf, 'web') };
   }
   if (/^file:/i.test(path)) {
     const url = new URL(path);
@@ -112,7 +113,10 @@ export function newMaterialPath(title: string, existing: Iterable<string>): stri
   const paths = new Set([...existing].map(path => path.toLowerCase()));
   for (let n = 1; ; n++) { const path = `資料/${name}${n === 1 ? '' : ` (${n})`}.md`; if (!paths.has(path.toLowerCase())) return path; }
 }
+const materialBacklinks = new WeakMap<NoteIndex, Map<string, ReferenceHit[]>>();
 export function materialReferences(index: NoteIndex, material: Material): ReferenceHit[] {
+  let cache = materialBacklinks.get(index); if (!cache) { cache = new Map(); materialBacklinks.set(index, cache); }
+  const cacheKey = material.path + '\0' + material.file.path, saved = cache.get(cacheKey); if (saved) return saved;
   const key = location(material.path).key, hits: ReferenceHit[] = [];
   for (const file of index.files.values()) {
     if (file.path === material.file.path) continue;
@@ -122,13 +126,13 @@ export function materialReferences(index: NoteIndex, material: Material): Refere
       if (ref.syntax !== 'markdown') continue;
       try { if (location(ref.target).key !== key) continue; } catch { continue; }
       const line = file.content.slice(0, ref.from).split('\n').length;
-      const rawContext = file.content.split('\n').slice(Math.max(0, line - 2), line + 1).join('\n').trim();
+      const { context: rawContext, contextLine } = referenceContext(file.content, line);
       let context = rawContext;
       for (const link of noteReferences('context.md', rawContext, true).filter(link => link.syntax === 'markdown').sort((a, b) => b.from - a.from)) context = context.slice(0, link.from) + markdownDestination(rawContext.slice(link.labelFrom, link.labelTo)) + context.slice(link.to);
-      hits.push({ source, path: file.path, from: ref.from, line, context, date: dates.filter(date => date.from <= ref.from).at(-1)?.date, fragment: '' });
+      hits.push({ source, path: file.path, from: ref.from, line, context, contextLine, date: dates.filter(date => date.from <= ref.from).at(-1)?.date, fragment: '' });
     }
   }
-  return hits;
+  cache.set(cacheKey, hits); return hits;
 }
 export function rewriteMaterialLinks(index: NoteIndex, paths: string[], destination: string): FileWrite[] {
   const keys = new Set(paths.map(path => location(path).key)), href = location(destination).href, writes: FileWrite[] = [];

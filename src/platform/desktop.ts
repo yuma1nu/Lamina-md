@@ -14,7 +14,8 @@ export interface DesktopApi {
   readWorkspace(): Promise<unknown>;
   saveWorkspace(session: WorkspaceSession): Promise<void>;
   openWebLink(url: string): Promise<void>;
-  openResource(path: string): Promise<void>;
+  openResource(path: string, kind?: string): Promise<void>;
+  catalogStamp?(): Promise<string>;
   readCatalog(): Promise<Catalog>;
   applyOperation(operation: Operation): Promise<Catalog>;
   trashNote(path: string, revision: string): Promise<Catalog>;
@@ -29,7 +30,8 @@ export const desktop: DesktopApi = {
   readWorkspace: () => invoke('read_workspace'),
   saveWorkspace: session => invoke('save_workspace', { session }),
   openWebLink: url => invoke('open_web_link', { url }),
-  openResource: path => invoke('open_resource', { path }),
+  openResource: (path, kind) => invoke('open_resource', { path, kind: kind ?? null }),
+  catalogStamp: () => invoke('catalog_stamp'),
   readCatalog: () => invoke('read_catalog'),
   applyOperation: operation => invoke('apply_operation', { operation }),
   trashNote: (path, revision) => invoke('trash_note', { path, expectedRevision: revision }),

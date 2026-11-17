@@ -6,6 +6,7 @@ mod watching;
 mod images;
 mod resources;
 mod trash;
+mod office;
 
 use std::sync::Mutex;
 use tauri::State;
@@ -76,9 +77,12 @@ async fn read_resource_clipboard() -> Result<resources::ClipboardResources, Stri
 #[tauri::command]
 async fn read_dropped_image(path: String) -> Result<resources::DroppedImage, String> { resources::dropped_image(&path) }
 #[tauri::command]
-async fn open_resource(path: String, app: tauri::AppHandle) -> Result<(), String> {
+async fn open_resource(path: String, kind: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
     if path.to_ascii_lowercase().starts_with("https://") || path.to_ascii_lowercase().starts_with("http://") {
         let url = links::web_url(&path)?;
+        if let Some(uri) = office::office_uri(&path, kind.as_deref())? {
+            return app.opener().open_url(uri, None::<&str>).map_err(|error| format!("Officeデスクトップアプリを起動できませんでした。Officeのインストールと関連付けを確認するか、資料の詳細から「ブラウザで開く」を選んでください。\n{error}"));
+        }
         app.opener().open_url(url.as_str(), None::<&str>).map_err(|error| error.to_string())
     } else {
         let path = resources::resource_path(&path)?; resources::check_document(&path)?;
@@ -87,6 +91,11 @@ async fn open_resource(path: String, app: tauri::AppHandle) -> Result<(), String
     }
 }
 
+#[tauri::command]
+async fn catalog_stamp(state: State<'_, VaultState>) -> Result<String, String> {
+    let guard = state.0.lock().map_err(|_| "保管庫の状態を取得できません。")?;
+    guard.as_ref().ok_or("保管庫を開いてください。")?.catalog_stamp()
+}
 #[tauri::command]
 async fn read_catalog(state: State<'_, VaultState>) -> Result<catalog::Catalog, String> {
     let guard = state.0.lock().map_err(|_| "保管庫の状態を取得できません。")?;
@@ -131,7 +140,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::Builder::new().open_js_links_on_click(false).build())
         .manage(VaultState::default())
         .manage(watching::WatchState::default())
-        .invoke_handler(tauri::generate_handler![open_vault, read_document, save_document, create_theme, create_note, read_workspace, save_workspace, open_web_link, read_catalog, apply_operation, trash_note, watch_vault, read_image, write_image, inspect_resource, read_resource_clipboard, read_dropped_image, open_resource])
+        .invoke_handler(tauri::generate_handler![open_vault, read_document, save_document, create_theme, create_note, read_workspace, save_workspace, open_web_link, catalog_stamp, read_catalog, apply_operation, trash_note, watch_vault, read_image, write_image, inspect_resource, read_resource_clipboard, read_dropped_image, open_resource])
         .run(tauri::generate_context!())
         .expect("Lamina.mdの起動に失敗しました");
 }

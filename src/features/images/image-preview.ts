@@ -1,6 +1,6 @@
 import { StateEffect, StateField, type Range } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, type DecorationSet } from '@codemirror/view';
-import { compose } from '../../domain/documents';
+import { compose, type SourceFile } from '../../domain/documents';
 import { imageMarkup, imagePath, imageReferences, type ImageReference } from '../../domain/images';
 import { sourceFilesEffect, sourceFilesField } from '../editor/source-model';
 import { useWorkspace } from '../../app/workspace';
@@ -73,6 +73,7 @@ class ImageWidget extends WidgetType {
 }
 
 export function imageExtensions(root: string, edit: (request: ImageEditRequest) => void) {
+  const references = new WeakMap<SourceFile, ImageReference[]>();
   const images = StateField.define<{ decorations: DecorationSet; editing: number | null; version: number }>({
     create: state => build(state, null, 0),
     update(value, transaction) {
@@ -80,14 +81,16 @@ export function imageExtensions(root: string, edit: (request: ImageEditRequest) 
       let version = value.version;
       for (const effect of transaction.effects) { if (effect.is(editImageSource)) editing = effect.value; if (effect.is(refreshImages)) version++; }
       if (editing !== null && transaction.selection && transaction.state.doc.lineAt(editing).number !== transaction.state.doc.lineAt(transaction.state.selection.main.head).number) editing = null;
-      return transaction.docChanged || transaction.selection || transaction.effects.some(e => e.is(editImageSource) || e.is(refreshImages) || e.is(sourceFilesEffect)) ? build(transaction.state, editing, version) : value;
+      const selectedImagesMayChange = transaction.selection && [...transaction.startState.selection.ranges, ...transaction.state.selection.ranges].some(range => !range.empty);
+      return transaction.docChanged || selectedImagesMayChange || editing !== value.editing || transaction.effects.some(e => e.is(editImageSource) || e.is(refreshImages) || e.is(sourceFilesEffect)) ? build(transaction.state, editing, version) : value;
     },
     provide: field => [EditorView.decorations.from(field, value => value.decorations), EditorView.atomicRanges.of(view => view.state.field(field).decorations)],
   });
   function build(state: import('@codemirror/state').EditorState, editing: number | null, version: number) {
     const files = state.field(sourceFilesField), { segments } = compose(files), ranges: Range<Decoration>[] = [];
     files.forEach((file, index) => {
-      for (const ref of imageReferences(file.content)) {
+      let refs = references.get(file); if (!refs) { refs = imageReferences(file.content); references.set(file, refs); }
+      for (const ref of refs) {
         const absolute = { ...ref, from: segments[index].from + ref.from, to: segments[index].from + ref.to };
         if (absolute.from === editing || state.selection.ranges.some(range => !range.empty && range.from < absolute.to && range.to > absolute.from)) continue;
         // Inline replacement keeps images inside list items and paragraphs editable.

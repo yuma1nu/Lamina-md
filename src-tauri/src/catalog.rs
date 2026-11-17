@@ -7,7 +7,7 @@ pub struct TrackedEntry { pub path: String, pub kind: String, pub identity: Opti
 #[derive(Serialize, Deserialize)]
 struct Tracking { version: u8, entries: Vec<TrackedEntry> }
 #[derive(Serialize)]
-pub struct Catalog { pub snapshot: VaultSnapshot, pub files: Vec<DiskFile>, pub moves: Vec<PathMove>, pub previous: Vec<TrackedEntry>, pub warnings: Vec<String> }
+pub struct Catalog { pub stamp: Option<String>, pub snapshot: VaultSnapshot, pub files: Vec<DiskFile>, pub moves: Vec<PathMove>, pub previous: Vec<TrackedEntry>, pub warnings: Vec<String> }
 
 #[cfg(windows)]
 fn identity(path: &Path) -> Option<String> {
@@ -63,7 +63,24 @@ impl Vault {
         }
         Ok((snapshot, files, entries))
     }
+    // Metadata only: window activation should not read all note contents.
+    // Watcher events still request the full catalog even if a timestamp is unchanged.
+    pub fn catalog_stamp(&self) -> Result<String, String> {
+        let snapshot = self.snapshot()?;
+        let mut paths: Vec<String> = snapshot.themes.iter().flat_map(|theme| std::iter::once(theme.path.clone()).chain(theme.files.iter().map(|file| file.path.clone())))
+            .chain(snapshot.notes.iter().chain(snapshot.materials.iter()).map(|file| file.path.clone())).chain(snapshot.note_folders).collect();
+        paths.sort();
+        let mut signature = String::new();
+        for relative in paths {
+            let path = self.root.join(&relative); self.check_existing(&path)?;
+            let metadata = fs::metadata(&path).map_err(io_error)?;
+            let modified = metadata.modified().map_err(io_error)?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            signature.push_str(&format!("{relative}:{}:{modified}\n", metadata.len()));
+        }
+        Ok(digest(signature.as_bytes()))
+    }
     pub fn catalog(&self) -> Result<Catalog, String> {
+        let before = self.catalog_stamp()?;
         let (snapshot, files, current) = self.current_catalog()?;
         let tracking = self.root.join(".lamina/tracking.json");
         let previous = if tracking.exists() {
@@ -73,7 +90,8 @@ impl Vault {
             saved.entries
         } else { current.clone() };
         let (moves, warnings) = moved(&previous, &current);
-        Ok(Catalog { snapshot, files, previous, moves, warnings })
+        let after = self.catalog_stamp()?;
+        Ok(Catalog { stamp: (before == after).then_some(after), snapshot, files, previous, moves, warnings })
     }
     pub fn commit_tracking(&self) -> Result<(), String> {
         let (_, _, entries) = self.current_catalog()?;
@@ -86,6 +104,22 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_stamp_detects_writes_moves_and_empty_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::open(dir.path().to_str().unwrap(), true).unwrap();
+        vault.create_note("記録").unwrap();
+        let original = vault.catalog_stamp().unwrap();
+        assert_eq!(vault.catalog().unwrap().stamp, Some(original.clone()));
+        fs::write(dir.path().join("メモ/記録.md"), "追記").unwrap();
+        assert_ne!(vault.catalog_stamp().unwrap(), original);
+        let changed = vault.catalog_stamp().unwrap();
+        fs::create_dir(dir.path().join("メモ/整理")).unwrap();
+        assert_ne!(vault.catalog_stamp().unwrap(), changed);
+        let folder = vault.catalog_stamp().unwrap();
+        fs::rename(dir.path().join("メモ/記録.md"), dir.path().join("メモ/整理/記録.md")).unwrap();
+        assert_ne!(vault.catalog_stamp().unwrap(), folder);
+    }
     #[test]
     fn follows_offline_note_and_theme_moves_and_keeps_renames_unresolved() {
         let dir = tempfile::tempdir().unwrap(); let root = dir.path();

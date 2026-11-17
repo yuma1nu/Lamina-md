@@ -9,8 +9,9 @@ import { location, materialCatalog } from '../../domain/materials';
 import { taskMarker } from './task-list';
 export { markdownDestination } from '../../domain/markdown';
 
+const emptyNoteIndex: NoteIndex = { targets: [], files: new Map() };
 export const noteIndexEffect = StateEffect.define<NoteIndex>();
-export const noteIndexField = StateField.define<NoteIndex>({ create: () => ({ targets: [], files: new Map() }), update(value, transaction) { for (const effect of transaction.effects) if (effect.is(noteIndexEffect)) return effect.value; return value; } });
+export const noteIndexField = StateField.define<NoteIndex>({ create: () => emptyNoteIndex, update(value, transaction) { for (const effect of transaction.effects) if (effect.is(noteIndexEffect)) return effect.value; return value; } });
 class WikiLabel extends WidgetType {
   constructor(readonly target: string, readonly source: string, readonly label: string, readonly broken: boolean) { super(); }
   eq(other: WikiLabel) { return other.target === this.target && other.source === this.source && other.label === this.label && other.broken === this.broken; }
@@ -39,8 +40,8 @@ class ResourceLabel extends WidgetType {
 }
 
 type MarkdownTree = ReturnType<typeof markdownLanguage.parser.parse>;
-interface ParsedSource { path: string; text: string; from: number; tree: MarkdownTree }
-interface Preview { sources: ParsedSource[]; decorations: DecorationSet; hidden: DecorationSet }
+interface ParsedSource { path: string; text: string; from: number; tree: MarkdownTree; active?: string; ranges?: Range<Decoration>[]; hidden?: Range<Decoration>[] }
+interface Preview { index: NoteIndex; readOnly: boolean; selectionLines: string; sources: ParsedSource[]; decorations: DecorationSet; hidden: DecorationSet }
 
 class CodeLanguage extends WidgetType {
   constructor(readonly language: string) { super(); }
@@ -75,10 +76,12 @@ class TaskCheckbox extends WidgetType {
 
 function preview(state: EditorState, previous?: Preview): Preview {
   const files = state.field(sourceFilesField);
-  const index = state.field(noteIndexField, false) ?? { targets: [], files: new Map() };
+  const index = state.field(noteIndexField, false) ?? emptyNoteIndex;
+  const selectionLines = JSON.stringify(state.selection.ranges.map(range => [state.doc.lineAt(range.from).from, state.doc.lineAt(range.to).to]));
+  if (previous && previous.index === index && previous.readOnly === state.readOnly && previous.selectionLines === selectionLines && previous.sources.length === files.length && previous.sources.every((source, i) => source.path === files[i].path && source.text === files[i].content)) return previous;
   const resources = new Map(materialCatalog(index).materials.map(item => [location(item.path).key, item]));
   const { segments } = compose(files);
-  const sources = files.map((file, index) => ({ path: file.path, text: file.content, from: segments[index].from,
+  const sources: ParsedSource[] = files.map((file, index) => ({ path: file.path, text: file.content, from: segments[index].from,
     tree: previous?.sources.find(source => source.path === file.path && source.text === file.content)?.tree ?? markdownLanguage.parser.parse(file.content) }));
   const ranges: Range<Decoration>[] = [], hidden: Range<Decoration>[] = [];
   const edited = (from: number, to: number) => state.selection.ranges.some(range => {
@@ -97,6 +100,16 @@ function preview(state: EditorState, previous?: Preview): Preview {
 
   for (const source of sources) {
     const base = source.from;
+    const activeKey = JSON.stringify(state.selection.ranges.flatMap(range => {
+      const from = state.doc.lineAt(range.from).from, to = state.doc.lineAt(range.to).to;
+      return from <= base + source.text.length && to >= base ? [[Math.max(from, base) - base, Math.min(to, base + source.text.length) - base]] : [];
+    }));
+    const cached = previous?.sources.find(item => item.path === source.path && item.text === source.text && item.from === base && item.active === activeKey);
+    if (cached?.ranges && cached.hidden && previous?.index === index && previous.readOnly === state.readOnly) {
+      source.active = activeKey; source.ranges = cached.ranges; source.hidden = cached.hidden;
+      ranges.push(...cached.ranges); hidden.push(...cached.hidden); continue;
+    }
+    const rangeStart = ranges.length, hiddenStart = hidden.length;
     const frontmatter = /^---[ \t]*\n[\s\S]*?\n---[ \t]*(?:\n|$)/.exec(source.text)?.[0].length ?? 0;
     const refs = noteReferences(source.path, source.text);
     for (const ref of refs.filter(ref => ref.syntax === 'wiki')) {
@@ -181,9 +194,14 @@ function preview(state: EditorState, previous?: Preview): Preview {
       // marker with an atomic widget shifts vertical navigation on every line.
       if (node.name === 'ListMark') {
         const task = node.from < frontmatter ? null : taskMarker(source.text, node.to);
-        if (task) {
+        // An unfinished empty marker without a following space stays literal
+        // on its editing line, so typing there cannot inherit a hidden prefix.
+        if (task && (!active || task.bodyFrom > task.checkFrom + 2)) {
           const bodyFrom = base + task.bodyFrom, label = state.doc.sliceString(bodyFrom, state.doc.lineAt(bodyFrom).to);
-          ranges.push(Decoration.mark({ class: 'cm-task-prefix', attributes: { 'aria-hidden': 'true' } }).range(from, bodyFrom));
+          // Leave the following space outside the transparent prefix. Chromium
+          // inserts IME preedit text into the DOM node at the caret; including
+          // that space makes a new empty task inherit transparent text color.
+          ranges.push(Decoration.mark({ class: 'cm-task-prefix', attributes: { 'aria-hidden': 'true' } }).range(from, base + task.checkFrom + 2));
           ranges.push(Decoration.widget({ widget: new TaskCheckbox(base + task.checkFrom, task.checked, label, state.readOnly), side: -1 }).range(from));
         } else if (/^[-+*]$/.test(source.text.slice(node.from, node.to))) ranges.push(Decoration.mark({ class: 'cm-list-bullet', attributes: { 'aria-hidden': 'true' } }).range(from, to));
       }
@@ -212,8 +230,9 @@ function preview(state: EditorState, previous?: Preview): Preview {
       // Images and HTML remain literal until their dedicated rendering is added.
       if (node.name === 'Image' || node.name === 'LinkReference') return false;
     } });
+    source.active = activeKey; source.ranges = ranges.slice(rangeStart); source.hidden = hidden.slice(hiddenStart);
   }
-  return { sources, decorations: Decoration.set(ranges, true), hidden: Decoration.set(hidden, true) };
+  return { index, readOnly: state.readOnly, selectionLines, sources, decorations: Decoration.set(ranges, true), hidden: Decoration.set(hidden, true) };
 }
 
 export const livePreview = StateField.define<Preview>({

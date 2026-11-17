@@ -1,8 +1,11 @@
+import { workspacePreferences, type WorkspacePreferences, type MaterialsPosition } from '../domain/workspace-preferences';
 import { create } from 'zustand';
 import { applyChanges, compose, ensureToday, fromDisk, isDirty, serializeFile } from '../domain/documents';
 import type { OpenDocument, TextChange, ThemeEntry, VaultSnapshot } from '../domain/documents';
 import { desktop, type DesktopApi } from '../platform/desktop';
 import { SaveQueue } from '../services/save-queue';
+import { preserveRefreshFocus } from './refresh-focus';
+import { sharePointOfficeType } from '../domain/sharepoint';
 import { readSession, type EditorPosition, type WorkspaceSession } from '../domain/session';
 import { documentPosition } from '../domain/session';
 import { decode, makeIndex, mapPath, movedSnapshot, newNotePath, oldIndex, resolveNote, rewriteLinks, wikiLink, type Catalog, type NoteIndex, type Operation, type PathMove, type ReferenceHit } from '../domain/note-links';
@@ -12,6 +15,7 @@ import { canOpenMaterial, location, materialCatalog, materialLink, newMaterialPa
 export interface Tab { id: string; pinned: boolean }
 export interface Pane { tabs: Tab[]; active: string | null }
 export interface Workspace {
+  preferences: WorkspacePreferences;
   vault: VaultSnapshot | null;
   catalog: Catalog | null;
   documents: Record<string, OpenDocument>;
@@ -30,9 +34,10 @@ export interface Workspace {
   annotationOpen: boolean;
   materialOpen: boolean;
   error: string | null;
+  errorRecovery: { message: string; title: string; label: string; note?: string; target?: string; retry: () => Promise<void>; browser?: () => Promise<void> } | null;
   jump: { id: string; anchor: number; sequence: number } | null;
 }
-const initial = (): Workspace => ({ vault: null, catalog: null, documents: {}, panes: [{ tabs: [], active: null }, { tabs: [], active: null }], activePane: 0, split: false, outline: true, sidebar: true, views: [{}, {}], busy: false, closing: false, inspector: 'backlinks', materialDetail: null, missingLink: null, selectionText: '', annotationOpen: false, materialOpen: false, error: null, jump: null });
+const initial = (): Workspace => ({ preferences: workspacePreferences(), vault: null, catalog: null, documents: {}, panes: [{ tabs: [], active: null }, { tabs: [], active: null }], activePane: 0, split: false, outline: true, sidebar: true, views: [{}, {}], busy: false, closing: false, inspector: 'backlinks', materialDetail: null, missingLink: null, selectionText: '', annotationOpen: false, materialOpen: false, error: null, errorRecovery: null, jump: null });
 export const useWorkspace = create<Workspace>(initial);
 const store = useWorkspace;
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
@@ -44,9 +49,14 @@ export class WorkspaceController {
   private sessionTimer?: ReturnType<typeof setTimeout>;
   private startup?: Promise<void>;
   private generation = 0;
+  private externalForced = false;
   private externalTimer?: ReturnType<typeof setTimeout>;
   private closedTabs: { id: string; pane: 0 | 1; pinned: boolean }[] = [];
   private closingTabs = new Set<string>();
+  private composingEditors = new Set<object>();
+  setEditorComposing(editor: object, active: boolean) {
+    if (active) this.composingEditors.add(editor); else this.composingEditors.delete(editor);
+  }
   private cachedIndex?: { catalog: Catalog | null; documents: Workspace['documents']; vault: VaultSnapshot | null; index: NoteIndex };
   index(): NoteIndex {
     const state = store.getState(), cached = this.cachedIndex;
@@ -61,25 +71,32 @@ export class WorkspaceController {
   start() {
     const unsubscribe = store.subscribe((state, before) => {
       if (!state.vault || state.busy || state.closing) return;
-      if (state.panes !== before.panes || state.views !== before.views || state.activePane !== before.activePane || state.split !== before.split || state.outline !== before.outline || state.sidebar !== before.sidebar || state.inspector !== before.inspector) {
+      if (state.panes !== before.panes || state.views !== before.views || state.activePane !== before.activePane || state.split !== before.split || state.outline !== before.outline || state.sidebar !== before.sidebar || state.inspector !== before.inspector || state.preferences !== before.preferences) {
         clearTimeout(this.sessionTimer);
         this.sessionTimer = setTimeout(() => { void this.sessionQueue.run('workspace').catch(() => {}); }, 500);
       }
     });
     return () => { unsubscribe(); clearTimeout(this.sessionTimer); clearTimeout(this.externalTimer); };
   }
-  requestExternalRefresh() {
+  requestExternalRefresh(force = true) {
+    this.externalForced ||= force;
     clearTimeout(this.externalTimer);
     this.externalTimer = setTimeout(() => { void this.checkExternal(); }, 350);
   }
   private async checkExternal() {
     const state = store.getState(); if (!state.catalog || state.closing) return;
-    if (state.busy || state.annotationOpen || state.materialOpen || Object.values(state.documents).some(document => document.files.some(isDirty))) { this.requestExternalRefresh(); return; }
+    if (state.busy || state.annotationOpen || state.materialOpen || this.composingEditors.size || Object.values(state.documents).some(document => document.files.some(isDirty))) { this.requestExternalRefresh(false); return; }
     try {
-      const generation = this.generation, fresh = await this.api.readCatalog();
+      const generation = this.generation;
+      const forced = this.externalForced; this.externalForced = false;
+      if (!forced && state.catalog.stamp && this.api.catalogStamp && await this.api.catalogStamp() === state.catalog.stamp) return;
+      const fresh = await this.api.readCatalog();
       if (generation !== this.generation || store.getState().busy || store.getState().closing) return;
+      const current = store.getState();
+      if (this.composingEditors.size || current.annotationOpen || current.materialOpen || Object.values(current.documents).some(document => document.files.some(isDirty))) { this.requestExternalRefresh(); return; }
       const signature = (catalog: Catalog) => JSON.stringify({ files: catalog.files.map(file => [file.path, file.revision]).sort(), themes: catalog.snapshot.themes.map(theme => theme.path).sort(), folders: catalog.snapshot.noteFolders ?? [] });
       if (fresh.moves.length || signature(fresh) !== signature(store.getState().catalog!)) await this.refresh();
+      else if (fresh.stamp !== store.getState().catalog?.stamp) store.setState({ catalog: fresh });
     } catch (error) { store.setState({ error: `外部変更を読み込めませんでした。\n${message(error)}` }); }
   }
   resume(): Promise<void> {
@@ -90,7 +107,7 @@ export class WorkspaceController {
   }
   private session(): WorkspaceSession {
     const state = store.getState();
-    return { version: 1, activePane: state.activePane, split: state.split, outline: state.outline, sidebar: state.sidebar, inspector: state.inspector,
+    return { version: 1, preferences: state.preferences, activePane: state.activePane, split: state.split, outline: state.outline, sidebar: state.sidebar, inspector: state.inspector,
       panes: state.panes.map((pane, index) => ({ active: pane.active, tabs: pane.tabs.flatMap(tab => {
         const document = state.documents[tab.id];
         return document ? [{ ...tab, kind: document.kind, view: state.views[index][tab.id] }] : [];
@@ -100,6 +117,10 @@ export class WorkspaceController {
     if (!store.getState().vault) return;
     try { await this.api.saveWorkspace(this.session()); }
     catch (error) { store.setState({ error: `.lamina/workspace.json を保存できませんでした。\n${message(error)}` }); throw error; }
+  }
+  updatePreferences(patch: Partial<WorkspacePreferences>) { store.setState(state => ({ preferences: { ...state.preferences, ...patch } })); }
+  updateMaterials(pane: 0 | 1, patch: Partial<MaterialsPosition>) {
+    store.setState(state => { const materials = [...state.preferences.materials] as WorkspacePreferences['materials']; materials[pane] = { ...materials[pane], ...patch }; return { preferences: { ...state.preferences, materials } }; });
   }
   captureView(pane: 0 | 1, id: string, position: EditorPosition) {
     store.setState(state => {
@@ -123,7 +144,7 @@ export class WorkspaceController {
           return { catalog: state.catalog ? { ...state.catalog, files: [...state.catalog.files.filter(f => f.path !== saved.path), saved] } : null, documents: { ...state.documents, [id]: { ...latest, files: latest.files.map(f => f.path === file.path ? { ...f, revision: saved.revision, savedContent: fromDisk(saved).content } : f) } } };
         });
       } catch (error) {
-        store.setState({ error: `${file.path} を保存できませんでした。\n${message(error)}` });
+        this.reportError(`${file.path} を保存できませんでした。\n${message(error)}`, { title: 'ノートを保存できませんでした', label: '保存を再試行', note: '入力内容は画面に残っています。', retry: () => this.flush() });
         throw error;
       }
     }
@@ -167,20 +188,28 @@ export class WorkspaceController {
       if (!store.getState().error) store.setState({ error: `終了処理を完了できませんでした。\n${message(error)}` });
     }
   }
+  private reportError(message: string, recovery: Omit<NonNullable<Workspace['errorRecovery']>, 'message'>) { store.setState({ error: message, errorRecovery: { message, ...recovery } }); }
   async openWebLink(url: string) {
     if (store.getState().closing || store.getState().busy) return;
-    try { await this.api.openWebLink(url); }
-    catch (error) { store.setState({ error: `リンク先を開けませんでした。\n${message(error)}` }); }
+    const previousError = store.getState().error, previousTarget = store.getState().errorRecovery?.target;
+    try { await this.api.openWebLink(url); if (store.getState().error === previousError && previousTarget === url) store.setState({ error: null, errorRecovery: null }); }
+    catch (error) { this.reportError(`リンク先を開けませんでした。\n${message(error)}`, { title: 'リンクを開けませんでした', label: 'リンクを再度開く', target: url, retry: () => this.openWebLink(url) }); }
   }
   async openResource(path: string) {
     if (store.getState().closing || store.getState().busy) return;
-    try { const value = canOpenMaterial(path); await this.api.openResource(value.path); }
-    catch (error) { store.setState({ error: `資料を開けませんでした。\n${message(error)}` }); }
+    try {
+      const value = canOpenMaterial(path), material = this.materials().materials.find(item => location(item.path).key === value.key);
+      if (value.web && !sharePointOfficeType(value.path, material?.type ?? value.type)) return this.openWebLink(value.path);
+      const previousError = store.getState().error, previousTarget = store.getState().errorRecovery?.target;
+      await this.api.openResource(value.path, material?.type ?? value.type);
+      if (store.getState().error === previousError && previousTarget === path) store.setState({ error: null, errorRecovery: null });
+    }
+    catch (error) { this.reportError(`資料を開けませんでした。\n${message(error)}`, { title: '資料を開けませんでした', label: '資料を再度開く', target: path, retry: () => this.openResource(path), ...(/^https:\/\//i.test(path) ? { browser: () => this.openWebLink(path) } : {}) }); }
   }
   materials() { return materialCatalog(this.index()); }
   showMaterialDetail(path: string, pane: 0 | 1, documentId: string) {
     if (store.getState().busy || store.getState().closing) return;
-    store.setState({ materialDetail: { path, pane, documentId }, outline: true });
+    store.setState(state => ({ materialDetail: { path, pane, documentId }, outline: true, preferences: { ...state.preferences, inspectorNarrow: true } }));
   }
   openMaterials(pane: 0 | 1 = store.getState().activePane) { this.attach({ id: '@materials', label: '資料一覧', kind: 'materials', files: [] }, pane, true); }
   async saveMaterial(value: MaterialProperties, original?: Material, insertion?: MaterialInsertion, merge?: Material, body?: string) {
@@ -397,13 +426,16 @@ export class WorkspaceController {
     }) as Workspace['panes'];
     this.closedTabs = this.closedTabs.map(tab => ({ ...tab, id: mapPath(tab.id, moves) }));
     const materialDetail = state.materialDetail ? { ...state.materialDetail, path: mapPath(state.materialDetail.path, moves), documentId: mapPath(state.materialDetail.documentId, moves) } : null;
-    store.setState({ vault: catalog.snapshot, catalog, documents, panes, views, selectionText: '', jump: null,
+    const preferences = moves.length ? { ...state.preferences, collapsedFolders: state.preferences.collapsedFolders.map(path => mapPath(path, moves)), materials: state.preferences.materials.map(value => ({ ...value, selected: value.selected ? mapPath(value.selected, moves) : null, checked: value.checked.map(path => mapPath(path, moves)) })) as WorkspacePreferences['materials'] } : state.preferences;
+    store.setState({ preferences, vault: catalog.snapshot, catalog, documents, panes, views, selectionText: '', jump: null,
       materialDetail: materialDetail && documents[materialDetail.documentId] && index.files.has(materialDetail.path) ? materialDetail : null,
       ...(state.split && !panes[1].tabs.length ? { split: false, activePane: 0 as const } : {}) });
   }
   async refresh() {
     if (store.getState().annotationOpen || store.getState().materialOpen) return;
     if (!store.getState().vault || store.getState().busy || store.getState().closing) return;
+    if (this.composingEditors.size) { this.requestExternalRefresh(); return; }
+    const restoreFocus = preserveRefreshFocus();
     store.setState({ busy: true });
     try {
       await this.flushDocuments();
@@ -412,7 +444,7 @@ export class WorkspaceController {
       await this.sessionQueue.run('workspace');
       store.setState({ error: catalog.warnings.join('\n') || null });
     } catch (error) { store.setState({ error: message(error) }); }
-    finally { store.setState({ busy: false }); }
+    finally { store.setState({ busy: false }); restoreFocus(); }
   }
   private async restore(vault: VaultSnapshot, moves: PathMove[] = []) {
     const session = readSession(await this.api.readWorkspace());
@@ -444,7 +476,7 @@ export class WorkspaceController {
       const tabs = pane.tabs.filter(tab => documents[tab.id]).map(({ id, pinned }) => ({ id, pinned }));
       return { tabs, active: tabs.some(tab => tab.id === pane.active) ? pane.active : tabs[0]?.id ?? null };
     }) as Workspace['panes'];
-    store.setState({ documents, views, panes, split: session.split, activePane: session.activePane, outline: session.outline, sidebar: session.sidebar, inspector: session.inspector ?? 'backlinks',
+    store.setState({ preferences: session.preferences ?? workspacePreferences(), documents, views, panes, split: session.split, activePane: session.activePane, outline: session.outline, sidebar: session.sidebar, inspector: session.inspector ?? 'backlinks',
       ...(missing.size ? { error: `次のタブを復元できませんでした。ファイルの移動・削除やアクセス権を確認してください。\n${[...missing].join('\n')}` } : {}) });
   }
   private attach(document: OpenDocument, pane: 0 | 1, newTab = false) {

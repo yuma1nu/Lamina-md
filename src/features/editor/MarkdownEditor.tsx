@@ -1,3 +1,4 @@
+import { restoredHistory, retainHistory } from './editor-history';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ChangeSet, Compartment, EditorState, StateField, Transaction } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, drawSelection, keymap, type DecorationSet } from '@codemirror/view';
@@ -6,6 +7,7 @@ import { markdown } from '@codemirror/lang-markdown';
 import { foldEffect, foldedRanges, indentUnit, unfoldEffect } from '@codemirror/language';
 import { compose, projectChanges, type OpenDocument, type Segment } from '../../domain/documents';
 import { useWorkspace, workspace } from '../../app/workspace';
+import { trackPendingFocus } from '../../app/refresh-focus';
 import { documentPosition, filePosition } from '../../domain/session';
 import { changesOf, sourceFilesEffect, sourceFilesField } from './source-model';
 import { livePreview, noteIndexEffect, noteIndexField, previewLinkEvents } from './live-preview';
@@ -53,6 +55,10 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
   latest.current = document;
   useLayoutEffect(() => {
     const current = latest.current;
+    const historyKey = `${useWorkspace.getState().vault?.root}\0${pane}\0${current.id}\0${bodyOnly}`;
+    const focusOwner = window.document.activeElement;
+    const mayAutoFocus = !(focusOwner instanceof HTMLElement && focusOwner.matches('input, textarea, select'));
+    const stillRequested = trackPendingFocus();
     const saved = useWorkspace.getState().views[pane][current.id];
     const startingSelection = saved ? { anchor: documentPosition(current.files, saved.anchor), head: documentPosition(current.files, saved.head) } : { anchor: 0 };
     let restoring = !!saved;
@@ -80,13 +86,13 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
         selection: startingSelection,
         extensions: [
           editability.of([EditorState.readOnly.of(locked), EditorView.editable.of(!locked)]),
-          markdown({ addKeymap: false }), history(), drawSelection(), noteIndexField.init(() => workspace.index()), noteCompletion((target, path) => void workspace.createLinkedNote(target, path, pane, true)), keymap.of([{ key: 'ArrowLeft', run: listCursorLeft }, { key: 'Enter', run: markdownEnter }, { key: 'Shift-Enter', run: markdownSoftBreak }, { key: 'Backspace', run: markdownBackspace }, { key: 'Delete', run: markdownDelete }, { key: 'Mod-l', run: markdownTaskToggle, preventDefault: true }, { key: 'Alt-ArrowUp', run: markdownListMoveUp, preventDefault: true }, { key: 'Alt-ArrowDown', run: markdownListMoveDown, preventDefault: true }, { key: 'Tab', run: markdownListIndent, shift: markdownListDedent }, { key: 'Mod-Shift-z', run: redo, preventDefault: true }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
+          markdown({ addKeymap: false }), history(), restoredHistory(historyKey, compose(current.files).text), drawSelection(), noteIndexField.init(() => workspace.index()), noteCompletion((target, path) => void workspace.createLinkedNote(target, path, pane, true)), keymap.of([{ key: 'ArrowLeft', run: listCursorLeft }, { key: 'Enter', run: markdownEnter }, { key: 'Shift-Enter', run: markdownSoftBreak }, { key: 'Backspace', run: markdownBackspace }, { key: 'Delete', run: markdownDelete }, { key: 'Mod-l', run: markdownTaskToggle, preventDefault: true }, { key: 'Alt-ArrowUp', run: markdownListMoveUp, preventDefault: true }, { key: 'Alt-ArrowDown', run: markdownListMoveDown, preventDefault: true }, { key: 'Tab', run: markdownListIndent, shift: markdownListDedent }, { key: 'Mod-Shift-z', run: redo, preventDefault: true }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
           markdownFormatting, indentUnit.of('    '), EditorState.tabSize.of(4),
           sourceFilesField.init(() => current.files),
           listPrefixField, listCaretGuard,
           materials.extensions,
           imageExtensions(useWorkspace.getState().vault!.root, setImageRequest),
-          EditorView.lineWrapping, monthly, livePreview, headingFolding, previewLinkEvents(url => void (/^https?:\/\//i.test(url) ? workspace.openWebLink(url) : workspace.openResource(url)), (target, path, pane, newTab, syntax) => void workspace.openInternalLink(target, path, pane, newTab, syntax), pane),
+          EditorView.lineWrapping, monthly, livePreview, headingFolding, previewLinkEvents(url => void workspace.openResource(url), (target, path, pane, newTab, syntax) => void workspace.openInternalLink(target, path, pane, newTab, syntax), pane),
           EditorView.contentAttributes.of({ 'aria-label': `${current.label}の本文`, spellcheck: 'false' }),
           EditorState.transactionExtender.of(transaction =>
             transaction.isUserEvent('input.indent') || transaction.isUserEvent('delete.dedent') || transaction.isUserEvent('input.image') || transaction.isUserEvent('input.material') || transaction.isUserEvent('input.task') || transaction.isUserEvent('input.format') || transaction.isUserEvent('move.list') || transaction.isUserEvent('delete.join')
@@ -114,11 +120,15 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
             if (update.docChanged || update.selectionSet) { restoring = false; capture(update.view); }
             else if (!restoring && update.transactions.some(tr => tr.effects.some(effect => effect.is(foldEffect) || effect.is(unfoldEffect)))) capture(update.view);
           }),
-          EditorView.domEventHandlers({ scroll: (_event, view) => { capture(view); } }),
+          EditorView.domEventHandlers({
+            scroll: (_event, view) => { capture(view); },
+            compositionstart: (_event, view) => { workspace.setEditorComposing(view, true); },
+            compositionend: (_event, view) => { workspace.setEditorComposing(view, false); },
+          }),
           EditorView.theme({
             '&': { backgroundColor: 'transparent', color: 'var(--text)', height: '100%' },
-            '.cm-scroller': { fontFamily: 'var(--font-body)', lineHeight: '1.95', overflow: 'auto' },
-            '.cm-content': { padding: '24px 0 180px', maxWidth: '780px', margin: '0 auto', width: '100%', caretColor: '#e0e2de' },
+            '.cm-scroller': { fontFamily: 'var(--font-body)', lineHeight: '1.8', overflow: 'auto' },
+            '.cm-content': { padding: '16px 0 140px', maxWidth: '780px', margin: '0 auto', width: '100%', caretColor: '#e0e2de' },
             '.cm-line': { padding: '0 42px' },
             '.cm-cursor': { borderLeftColor: '#e0e2de' },
             '&.cm-focused': { outline: 'none' },
@@ -141,14 +151,16 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
     view.requestMeasure({
       read: () => saved?.scrollTop ?? 0,
       write: top => {
+        const mayFocus = stillRequested();
         if (editor.current !== view) return;
         if (saved && restoring) view.scrollDOM.scrollTop = top;
         restoring = false;
         const state = useWorkspace.getState();
-        if (state.activePane === pane && state.panes[pane].active === current.id) view.focus();
+        const owner = window.document.activeElement;
+        if (mayAutoFocus && mayFocus && !state.busy && !state.closing && window.document.hasFocus() && state.activePane === pane && state.panes[pane].active === current.id && (owner === focusOwner || owner === window.document.body || owner === view.contentDOM)) view.focus();
       },
     });
-    return () => { stopDrops(); window.removeEventListener('lamina-images-changed', imagesChanged); capture(view); editor.current = null; view.destroy(); };
+    return () => { stillRequested(); workspace.setEditorComposing(view, false); stopDrops(); window.removeEventListener('lamina-images-changed', imagesChanged); capture(view); retainHistory(historyKey, view.state); editor.current = null; view.destroy(); };
   }, [document.id, pane, bodyOnly]);
   useEffect(() => {
     editor.current?.dispatch({ effects: editability.reconfigure([EditorState.readOnly.of(locked), EditorView.editable.of(!locked)]) });

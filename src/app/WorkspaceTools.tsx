@@ -1,4 +1,6 @@
-import { useEffect, useRef, useState, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { ReferenceExcerpt } from '../ui/ReferenceExcerpt';
+import { useShallow } from 'zustand/react/shallow';
+import { memo, useEffect, useRef, useState, useDeferredValue, type FormEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { ChevronRight, FileText, FilePlus2, Folder, FolderPlus, FolderUp, MoreHorizontal, Pencil, FolderInput, Scissors, Search, RefreshCw, X, Link2, List, Trash2 } from 'lucide-react';
 import { useWorkspace, workspace } from './workspace';
 import { decode, newNotePath, referenceHits, searchNotes } from '../domain/note-links';
@@ -22,8 +24,10 @@ export function ItemActions({ path, onEdit, folder = false }: { path: string; on
   </div></details>;
 }
 
-export function NoteTree({ notes, folders, query, active, onEdit }: { notes: FileEntry[]; folders: string[]; query: string; active: string | null; onEdit: (request: EditRequest) => void }) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+export const NoteTree = memo(function NoteTree({ notes, folders, query, active, onEdit }: { notes: FileEntry[]; folders: string[]; query: string; active: string | null; onEdit: (request: EditRequest) => void }) {
+  const collapsedFolders = useWorkspace(state => state.preferences.collapsedFolders);
+  const collapsed = new Set(collapsedFolders);
+  const setCollapsed = (next: Set<string> | ((value: Set<string>) => Set<string>)) => workspace.updatePreferences({ collapsedFolders: [...(typeof next === 'function' ? next(collapsed) : next)] });
   const [dragged, setDragged] = useState<{ path: string; root: string } | null>(null), [over, setOver] = useState<string | null>(null);
   const dragSource = useRef<{ path: string; root: string } | null>(null);
   const nav = useRef<HTMLElement>(null), pointerCleanup = useRef<(() => void) | null>(null), suppressClickUntil = useRef(0);
@@ -107,31 +111,34 @@ export function NoteTree({ notes, folders, query, active, onEdit }: { notes: Fil
     </>;
   }
   return <nav ref={nav} aria-label="メモ" onClickCapture={event => { if (Date.now() < suppressClickUntil.current) { event.preventDefault(); event.stopPropagation(); } }}>{children('メモ', 0)}<div data-note-drop="メモ" className={`note-root-drop${dropClass('メモ')}`} role="group" aria-label="メモ直下への移動先" hidden={!dragged}><FolderUp size={14} /><span>メモ直下に移動</span></div>{dragged && <p className="note-drag-hint" role="status">{over && dropProblem(over) || 'フォルダーへドラッグして整理'}</p>}{dragged && pointer && <div className="note-drag-preview" aria-hidden style={{ left: pointer.x + 14, top: pointer.y + 12 }}><FileText size={14} />{dragged.path.split('/').at(-1)?.replace(/\.md$/i, '')}</div>}</nav>;
-}
+});
 
 export function Inspector({ document }: { document: OpenDocument }) {
-  const state = useWorkspace(), index = workspace.index();
+  const state = useWorkspace(useShallow(state => ({ inspector: state.inspector, catalog: state.catalog, documents: state.documents, activePane: state.activePane, jump: state.jump }))), index = workspace.index();
   let material: Material | null = null;
   if (document.kind === 'material') { try { material = readMaterial(document.files[0]); } catch { /* The raw document remains editable. */ } }
   const refs = referenceHits(index, document.id);
   const outline = outlineHeadings(document.files);
   return <aside className="outline-panel"><div className="inspector-tabs" role="tablist" aria-label="右サイドバー"><button role="tab" aria-selected={state.inspector === 'backlinks'} onClick={() => useWorkspace.setState({ inspector: 'backlinks' })}><Link2 size={13} />バックリンク<span>{material ? materialReferences(index, material).length : refs.length}</span></button><button role="tab" aria-selected={state.inspector === 'outline'} onClick={() => useWorkspace.setState({ inspector: 'outline' })}><List size={13} />目次</button></div><span className="outline-title">{document.label}</span>
     {state.inspector === 'outline' ? outline.length ? <nav aria-label="本文の目次">{outline.map(heading => <button key={`${heading.path}:${heading.from}`} data-heading-level={heading.level} style={{ paddingLeft: 8 + (heading.level - 1) * 12 }} title={`${heading.path.split('/').at(-1)} · H${heading.level}`} onClick={() => useWorkspace.setState({ jump: { id: document.id, anchor: heading.from, sequence: (state.jump?.sequence ?? 0) + 1 } })}>{heading.title}</button>)}</nav> : <p>本文の見出しがここに表示されます。</p>
-      : material ? <MaterialBacklinks material={material} pane={state.activePane} /> : refs.length ? <div className="backlink-list">{refs.map((hit, i) => <button className="backlink-card" key={`${hit.path}-${hit.from}-${i}`} title={`${hit.path}:${hit.line}`} onClick={event => { const mode = openMode(event); void workspace.openHit(hit, mode.pane, mode.newTab); }}><strong>{hit.source.name}</strong><span className="reference-meta">{hit.date ?? 'メモ'} · {hit.fragment ? `日付・見出し: ${hit.fragment}` : 'ノート全体'} · {hit.line}行</span><p>{hit.context}</p></button>)}</div> : <p>このノートへの参照はまだありません。<br />[[ からノートをつなげられます。</p>}
+      : material ? <MaterialBacklinks material={material} pane={state.activePane} /> : refs.length ? <div className="backlink-list">{refs.map((hit, i) => <button className="backlink-card" key={`${hit.path}-${hit.from}-${i}`} title={`${hit.path}:${hit.line}`} onClick={event => { const mode = openMode(event); void workspace.openHit(hit, mode.pane, mode.newTab); }}><strong>{hit.source.name}</strong><span className="reference-meta">{hit.date ?? 'メモ'} · {hit.fragment ? `日付・見出し: ${hit.fragment}` : 'ノート全体'} · {hit.line}行</span><ReferenceExcerpt hit={hit} /></button>)}</div> : <p>このノートへの参照はまだありません。<br />[[ からノートをつなげられます。</p>}
   </aside>;
 }
 
 export function WorkspaceTools({ onEdit }: { onEdit: (request: EditRequest) => void }) {
-  const state = useWorkspace(), [search, setSearch] = useState(false), [query, setQuery] = useState(''), [limit, setLimit] = useState(100);
+  const state = useWorkspace(useShallow(state => ({ selectionText: state.selectionText, documents: state.documents, panes: state.panes, activePane: state.activePane }))), [search, setSearch] = useState(false), [query, setQuery] = useState(''), [limit, setLimit] = useState(100);
   const dialog = useRef<HTMLDialogElement>(null), input = useRef<HTMLInputElement>(null);
-  const results = searchNotes(workspace.index(), query);
+  const deferredQuery = useDeferredValue(query), [selectedResult, setSelectedResult] = useState(0);
+  const results = search ? searchNotes(workspace.index(), deferredQuery) : [];
+  const resultIndex = Math.min(selectedResult, Math.max(0, Math.min(limit, results.length) - 1));
+  useEffect(() => { if (search) document.getElementById(`search-result-${resultIndex}`)?.scrollIntoView({ block: 'nearest' }); }, [resultIndex, search]);
   useEffect(() => { if (search) { dialog.current?.showModal(); input.current?.focus(); } else dialog.current?.close(); }, [search]);
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => { if (!event.isComposing && (event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'f') { event.preventDefault(); setSearch(true); } };
     window.addEventListener('keydown', keyboard); return () => window.removeEventListener('keydown', keyboard);
   }, []);
   return <><button className="icon-button" aria-label="保管庫内を検索" title="保管庫内を検索（Ctrl+Shift+F）" onClick={() => setSearch(true)}><Search size={16} /></button><button className="icon-button" aria-label="選択範囲をメモに切り出す" title="選択範囲をメモに切り出す" disabled={!state.selectionText.trim() || state.documents[state.panes[state.activePane].active ?? '']?.kind === 'material'} onClick={() => onEdit({ type: 'extract', path: '' })}><Scissors size={16} /></button><button className="icon-button" aria-label="保管庫を再読み込み" title="外部変更・移動を再読み込み" onClick={() => void workspace.refresh()}><RefreshCw size={16} /></button>
-    <dialog className="search-dialog" ref={dialog} aria-label="保管庫内を検索" onCancel={() => setSearch(false)} onClose={() => setSearch(false)}><div className="search-header"><Search size={17} /><input ref={input} aria-label="検索する文字列" placeholder="保管庫全体の本文を検索…" value={query} onChange={event => { setQuery(event.target.value); setLimit(100); }} /><button className="icon-button" aria-label="検索を閉じる" onClick={() => setSearch(false)}><X size={17} /></button></div><div className="search-results">{query.trim() ? <><span className="reference-meta">{results.length}件</span>{results.slice(0, limit).map((hit, i) => <button className="search-result" key={`${hit.path}-${hit.from}-${i}`} onClick={event => { const mode = openMode(event); dialog.current?.close(); setSearch(false); void workspace.openHit(hit, mode.pane, mode.newTab); }}><strong>{hit.source.name}</strong><span className="reference-meta">{hit.date ?? hit.path} · {hit.line}行</span><p>{hit.context}</p></button>)}{results.length > limit && <button className="button" onClick={() => setLimit(limit + 100)}>さらに表示</button>}{!results.length && <p className="empty-message">一致する記録はありません。</p>}</> : <p className="empty-message">技術ノートや日々の記録から、言葉を探せます。</p>}</div></dialog>
+    <dialog className="search-dialog" ref={dialog} aria-label="保管庫内を検索" onCancel={() => setSearch(false)} onClose={() => setSearch(false)}><div className="search-header"><Search size={17} /><input ref={input} aria-label="検索する文字列" role="combobox" aria-expanded={search} aria-controls="vault-search-results" aria-autocomplete="list" aria-activedescendant={results.length ? `search-result-${resultIndex}` : undefined} onKeyDown={event => { if (event.nativeEvent.isComposing) return; if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setSelectedResult(value => Math.max(0, Math.min(Math.min(limit, results.length) - 1, value + (event.key === 'ArrowDown' ? 1 : -1)))); } if (event.key === 'Enter' && results[resultIndex]) { event.preventDefault(); const mode = openMode(event as unknown as MouseEvent); setSearch(false); void workspace.openHit(results[resultIndex], mode.pane, mode.newTab); } }} placeholder="保管庫全体の本文を検索…" value={query} onChange={event => { setQuery(event.target.value); setSelectedResult(0); setLimit(100); }} /><button className="icon-button" aria-label="検索を閉じる" onClick={() => setSearch(false)}><X size={17} /></button></div><div className="search-results" id="vault-search-results" role="listbox" aria-label="検索結果">{query.trim() ? <><span className="reference-meta">{results.length}件</span>{results.slice(0, limit).map((hit, i) => <button className="search-result" role="option" aria-selected={i === resultIndex} id={`search-result-${i}`} onMouseEnter={() => setSelectedResult(i)} key={`${hit.path}-${hit.from}-${i}`} onClick={event => { const mode = openMode(event); dialog.current?.close(); setSearch(false); void workspace.openHit(hit, mode.pane, mode.newTab); }}><strong>{hit.source.name}</strong><span className="reference-meta">{hit.date ?? hit.path} · {hit.line}行</span><ReferenceExcerpt hit={hit} query={deferredQuery.trim()} /></button>)}{results.length > limit && <button className="button" onClick={() => setLimit(limit + 100)}>さらに表示</button>}{!results.length && <p className="empty-message">一致する記録はありません。</p>}</> : <p className="empty-message">技術ノートや日々の記録から、言葉を探せます。</p>}</div></dialog>
   </>;
 }
 

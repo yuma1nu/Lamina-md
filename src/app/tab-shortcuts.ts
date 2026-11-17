@@ -1,7 +1,14 @@
 import { useWorkspace, workspace } from './workspace';
+import { trackPendingFocus } from './refresh-focus';
 
 export function focusActiveEditor() {
-  requestAnimationFrame(() => document.querySelector<HTMLElement>('.active-pane .cm-content, .active-pane .material-search input')?.focus({ preventScroll: true }));
+  const owner = document.activeElement;
+  const stillRequested = trackPendingFocus();
+  requestAnimationFrame(() => {
+    if (!stillRequested() || !document.hasFocus() || document.querySelector('dialog[open]')) return;
+    if (document.activeElement !== owner && document.activeElement !== document.body) return;
+    document.querySelector<HTMLElement>('.active-pane .cm-content, .active-pane .material-search input')?.focus({ preventScroll: true });
+  });
 }
 
 export async function tabShortcut(event: KeyboardEvent, newNote: () => void) {

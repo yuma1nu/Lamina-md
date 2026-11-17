@@ -8,12 +8,14 @@ import { sourceFilesEffect, sourceFilesField } from './source-model';
 export interface HeadingFold { heading: number; from: number; to: number; title: string }
 export function headingFolds(state: EditorState): HeadingFold[] {
   const files = state.field(sourceFilesField), { segments } = compose(files), headings = outlineHeadings(files);
-  return headings.flatMap((heading, index) => {
+  const stacks = new Map<string, typeof headings>(), nextHeadings = new Map<number, number>();
+  for (let i = headings.length - 1; i >= 0; i--) { const heading = headings[i], stack = stacks.get(heading.path) ?? []; while (stack.length && stack.at(-1)!.level > heading.level) stack.pop(); if (stack.length) nextHeadings.set(heading.from, stack.at(-1)!.from); stack.push(heading); stacks.set(heading.path, stack); }
+  return headings.flatMap(heading => {
     const line = state.doc.lineAt(heading.from), segment = segments.find(segment => segment.path === heading.path)!;
     let from = line.to;
     if (!/^ {0,3}#{1,6}\s/.test(line.text) && line.number < state.doc.lines) from = state.doc.line(line.number + 1).to;
-    const next = headings.slice(index + 1).find(next => next.path === heading.path && next.level <= heading.level);
-    const to = next ? state.doc.lineAt(next.from).from - 1 : segment.to;
+    const next = nextHeadings.get(heading.from);
+    const to = next !== undefined ? state.doc.lineAt(next).from - 1 : segment.to;
     return to > from && state.doc.sliceString(from, to).trim() ? [{ heading: line.from, from, to, title: heading.title }] : [];
   });
 }
@@ -49,7 +51,7 @@ class HeadingToggle extends WidgetType {
 }
 const headingToggles = StateField.define<DecorationSet>({
   create: toggles,
-  update: (_value, tr) => toggles(tr.state),
+  update: (value, tr) => tr.state.field(headingFoldField) !== tr.startState.field(headingFoldField) || foldedRanges(tr.state) !== foldedRanges(tr.startState) ? toggles(tr.state) : value,
   provide: field => EditorView.decorations.from(field),
 });
 function toggles(state: EditorState) {

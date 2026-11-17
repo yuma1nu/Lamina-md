@@ -20,7 +20,9 @@ export interface Segment { index: number; from: number; to: number; path: string
 export interface TextChange { from: number; to: number; insert: string }
 export interface FileChange extends TextChange { index: number }
 
+const compositions = new WeakMap<SourceFile[], { text: string; segments: Segment[] }>();
 export function compose(files: SourceFile[]): { text: string; segments: Segment[] } {
+  const cached = compositions.get(files); if (cached) return cached;
   let text = '';
   const segments: Segment[] = [];
   files.forEach((file, index) => {
@@ -29,7 +31,7 @@ export function compose(files: SourceFile[]): { text: string; segments: Segment[
     text += file.content;
     segments.push({ index, from, to: text.length, path: file.path, label: file.path.split('/').at(-1)!.replace(/\.md$/i, '') });
   });
-  return { text, segments };
+  const result = { text, segments }; compositions.set(files, result); return result;
 }
 
 // Project edits onto physical files; virtual month separators never become file content.
