@@ -11,6 +11,13 @@ function editor(marked: string) {
   return { run(command: StateCommand) { command({ state, dispatch: tr => { state = tr.state; } }); }, text: () => state.doc.toString(), state: () => state };
 }
 describe('Markdownの書式操作', () => {
+  it('明示的な箇条書き変換は各行・空行・タスクを通常の箇条書きにし、繰り返しても解除しない', () => {
+    const edit = editor('|一\n\n- [x] 二\n3. 三\n    - 子|');
+    edit.run(formatLines('bullet', 'set'));
+    expect(edit.text()).toBe('- 一\n- \n- 二\n- 三\n    - 子');
+    edit.run(formatLines('bullet', 'set'));
+    expect(edit.text()).toBe('- 一\n- \n- 二\n- 三\n    - 子');
+  });
   it('コードブロックを作成・解除し、内側のフェンスより長い記号を選ぶ', () => {
     const edit = editor('|const n = 1;|'); edit.run(toggleCodeBlock); expect(edit.text()).toBe('```\nconst n = 1;\n```');
     edit.run(toggleCodeBlock); expect(edit.text()).toBe('const n = 1;');

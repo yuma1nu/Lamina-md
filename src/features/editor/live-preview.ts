@@ -61,7 +61,7 @@ class TaskCheckbox extends WidgetType {
   toDOM(view: EditorView) {
     const wrap = document.createElement('span'); wrap.className = 'cm-task-control';
     const input = document.createElement('input'); input.type = 'checkbox'; input.checked = this.checked; input.disabled = this.disabled;
-    input.setAttribute('aria-label', this.label || '空のタスク'); input.title = '完了／未完了を切り替え（Ctrl+L）';
+    input.setAttribute('aria-label', this.label || '空のタスク'); input.title = 'クリックで完了／未完了。Ctrl+Lで未完了→完了→チェック欄なし';
     input.addEventListener('mousedown', event => event.preventDefault());
     input.addEventListener('click', event => {
       event.stopPropagation();

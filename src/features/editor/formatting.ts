@@ -98,24 +98,29 @@ export const insertMarkdownLink: StateCommand = ({ state, dispatch }) => {
 };
 
 type BlockStyle = 'bullet' | 'ordered' | 'quote' | number;
-export function formatLines(style: BlockStyle): StateCommand {
+export function formatLines(style: BlockStyle, mode: 'toggle' | 'set' = 'toggle'): StateCommand {
   return ({ state, dispatch }) => {
     if (state.readOnly) return true;
     const changes: TextChange[] = [], seen = new Set<number>(), selected: { source: Source; number: number }[] = [];
     for (const source of sources(state)) for (const range of state.selection.ranges) for (const line of selectedLines(source, range)) {
       const at = source.base + line.from;
       if (seen.has(at) || blocked(source, line.from, line.to, false)) continue; seen.add(at);
-      if (!line.text.trim() && !range.empty) continue;
+      if (mode === 'toggle' && !line.text.trim() && !range.empty) continue;
       if (source.nodes.some(node => /^SetextHeading/.test(node.name) && contains(node, line.from, line.to) && node.from !== line.from)) continue;
       selected.push({ source, number: line.number });
     }
-    const markFor = (source: Source, number: number) => source.nodes.find(node => node.name === 'ListMark' && source.doc.lineAt(node.from).number === number);
+    const markFor = (source: Source, number: number) => {
+      const marker = source.nodes.find(node => node.name === 'ListMark' && source.doc.lineAt(node.from).number === number);
+      if (marker || mode === 'toggle') return marker;
+      const line = source.doc.line(number), raw = /^(?:[ \t]*>[ \t]?)*[ \t]*([-+*]|\d+[.)])(?=[ \t]|$)/.exec(line.text);
+      return raw ? { from: line.from + raw[0].length - raw[1].length, to: line.from + raw[0].length, parent: null } : undefined;
+    };
     const isTarget = (source: Source, number: number) => {
       if (style === 'quote') return /^[ \t]*>/.test(source.doc.line(number).text);
       const marker = markFor(source, number);
       return !!marker && (style === 'bullet' ? /^[-+*]$/.test(source.text.slice(marker.from, marker.to)) : /^\d+[.)]$/.test(source.text.slice(marker.from, marker.to)));
     };
-    const remove = selected.length > 0 && selected.every(({ source, number }) => isTarget(source, number));
+    const remove = mode === 'toggle' && selected.length > 0 && selected.every(({ source, number }) => isTarget(source, number));
     const rewritten = new Map<number, { source: Source; number: number; text: string }>(), removed: { source: Source; item: Node }[] = [], numbers = new Map<string, number>();
     for (const { source, number } of selected) {
       const line = source.doc.line(number), at = source.base + line.from;
@@ -130,7 +135,7 @@ export function formatLines(style: BlockStyle): StateCommand {
         const setext = source.nodes.find(node => /^SetextHeading/.test(node.name) && node.from === line.from);
         if (setext) changes.push({ from: at + line.length, to: source.base + setext.to, insert: '' });
       } else if (!heading) {
-        const end = list ? remove ? taskMarker(source.text, list.to)?.bodyFrom ?? list.to + /^[ \t]*/.exec(source.text.slice(list.to, line.to))![0].length : list.to + /^[ \t]*/.exec(source.text.slice(list.to, line.to))![0].length : line.from + quote.length;
+        const end = list ? remove || mode === 'set' && style === 'bullet' ? taskMarker(source.text, list.to)?.bodyFrom ?? list.to + /^[ \t]*/.exec(source.text.slice(list.to, line.to))![0].length : list.to + /^[ \t]*/.exec(source.text.slice(list.to, line.to))![0].length : line.from + quote.length;
         const item = list?.parent;
         const group = `${source.base}:${item?.parent?.from ?? 'plain'}:${quote}`;
         const ordinal = (numbers.get(group) ?? 0) + 1; numbers.set(group, ordinal);

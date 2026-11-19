@@ -1,6 +1,6 @@
 [package]
 name = "lamina-md"
-version = "0.1.4"
+version = "0.1.5"
 description = "Lamina.md — technical notes, one layer at a time"
 edition = "2021"
 

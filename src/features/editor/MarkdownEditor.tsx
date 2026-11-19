@@ -1,5 +1,5 @@
 import { restoredHistory, retainHistory } from './editor-history';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ChangeSet, Compartment, EditorState, StateField, Transaction } from '@codemirror/state';
 import { Decoration, EditorView, WidgetType, drawSelection, keymap, type DecorationSet } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory, redo } from '@codemirror/commands';
@@ -23,6 +23,8 @@ import { materialEditor } from '../materials/material-editor';
 import { materialCommitted } from '../materials/material-service';
 import { readMaterial } from '../../domain/materials';
 import { listCaretGuard, listCursorLeft, listPrefixField } from './list-navigation';
+import { editorLayout } from './editor-layout';
+import { EditorContextMenu, type ContextMenuTarget } from './EditorContextMenu';
 
 class MonthWidget extends WidgetType {
   constructor(readonly label: string) { super(); }
@@ -47,6 +49,8 @@ function boundaries(segments: Segment[]): DecorationSet {
 export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { document: OpenDocument; pane: 0 | 1; jump: { anchor: number; sequence: number } | null; bodyOnly?: boolean }) {
   const host = useRef<HTMLDivElement>(null), editor = useRef<EditorView | null>(null);
   const [imageRequest, setImageRequest] = useState<ImageEditRequest | null>(null);
+  const [menu, setMenu] = useState<ContextMenuTarget | null>(null);
+  const closeMenu = useCallback(() => setMenu(null), []);
   const latest = useRef(document);
   const locked = useWorkspace(state => state.busy || state.closing);
   const catalog = useWorkspace(state => state.catalog), documents = useWorkspace(state => state.documents);
@@ -89,7 +93,7 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
           markdown({ addKeymap: false }), history(), restoredHistory(historyKey, compose(current.files).text), drawSelection(), noteIndexField.init(() => workspace.index()), noteCompletion((target, path) => void workspace.createLinkedNote(target, path, pane, true)), keymap.of([{ key: 'ArrowLeft', run: listCursorLeft }, { key: 'Enter', run: markdownEnter }, { key: 'Shift-Enter', run: markdownSoftBreak }, { key: 'Backspace', run: markdownBackspace }, { key: 'Delete', run: markdownDelete }, { key: 'Mod-l', run: markdownTaskToggle, preventDefault: true }, { key: 'Alt-ArrowUp', run: markdownListMoveUp, preventDefault: true }, { key: 'Alt-ArrowDown', run: markdownListMoveDown, preventDefault: true }, { key: 'Tab', run: markdownListIndent, shift: markdownListDedent }, { key: 'Mod-Shift-z', run: redo, preventDefault: true }, indentWithTab, ...defaultKeymap, ...historyKeymap]),
           markdownFormatting, indentUnit.of('    '), EditorState.tabSize.of(4),
           sourceFilesField.init(() => current.files),
-          listPrefixField, listCaretGuard,
+          listPrefixField, listCaretGuard, editorLayout,
           materials.extensions,
           imageExtensions(useWorkspace.getState().vault!.root, setImageRequest),
           EditorView.lineWrapping, monthly, livePreview, headingFolding, previewLinkEvents(url => void workspace.openResource(url), (target, path, pane, newTab, syntax) => void workspace.openInternalLink(target, path, pane, newTab, syntax), pane),
@@ -128,7 +132,9 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
           EditorView.theme({
             '&': { backgroundColor: 'transparent', color: 'var(--text)', height: '100%' },
             '.cm-scroller': { fontFamily: 'var(--font-body)', lineHeight: '1.8', overflow: 'auto' },
-            '.cm-content': { padding: '16px 0 140px', maxWidth: '780px', margin: '0 auto', width: '100%', caretColor: '#e0e2de' },
+            // Start with enough space for a saved scroll offset; measurement
+            // then fits it to this pane while keeping the last three lines.
+            '.cm-content': { padding: '16px 0 var(--editor-end-space, 100dvh)', maxWidth: '780px', margin: '0 auto', width: '100%', caretColor: '#e0e2de' },
             '.cm-line': { padding: '0 42px' },
             '.cm-cursor': { borderLeftColor: '#e0e2de' },
             '&.cm-focused': { outline: 'none' },
@@ -190,5 +196,18 @@ export function MarkdownEditor({ document, pane, jump, bodyOnly = false }: { doc
     view.dispatch({ selection: { anchor }, effects: EditorView.scrollIntoView(anchor, { y: 'center' }) });
     view.focus();
   }, [jump?.sequence]);
-  return <><div className="editor-mount" ref={host} onFocusCapture={() => workspace.activate(pane)} />{imageRequest && <AnnotationEditor request={imageRequest} close={() => setImageRequest(null)} />}</>;
+  function openMenu(x?: number, y?: number) {
+    const view = editor.current; if (!view || locked || view.composing) return;
+    const caret = view.coordsAtPos(view.state.selection.main.head);
+    setMenu({ view, x: x || caret?.left || 8, y: y || caret?.bottom || 8 });
+  }
+  useEffect(() => { closeMenu(); }, [document.id, locked, closeMenu]);
+  return <><div className="editor-mount" ref={host} onFocusCapture={() => workspace.activate(pane)} onContextMenu={event => {
+    const view = editor.current;
+    if (event.shiftKey || !view || locked || view.composing) return;
+    if (view.state.selection.main.empty && event.target instanceof Element && event.target.closest('a, img, input, button')) return;
+    event.preventDefault(); openMenu(event.clientX, event.clientY);
+  }} onKeyDown={event => {
+    if (!event.nativeEvent.isComposing && (event.key === 'ContextMenu' || event.shiftKey && event.key === 'F10')) { event.preventDefault(); openMenu(); }
+  }} />{menu && <EditorContextMenu target={menu} current={() => editor.current} close={closeMenu} />}{imageRequest && <AnnotationEditor request={imageRequest} close={() => setImageRequest(null)} />}</>;
 }

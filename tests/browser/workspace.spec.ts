@@ -1,5 +1,5 @@
 import { connectTestVault } from './fixtures/vault';
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Locator, type Page } from '@playwright/test';
 import type { WorkspaceSession } from '../../src/domain/session';
 import { materialDraft, writeMaterial } from '../../src/domain/materials';
 
@@ -483,6 +483,179 @@ test('月次ノートの見出しとタスクをまとめて装飾し、ファ�
   await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toEqual([old, recent]);
 });
 
+for (const kind of ['memo', 'monthly'] as const) test(`${kind}の末尾を数行だけ上部に残してスクロールし、リサイズ後も本文を変更しない`, async ({ page }) => {
+  const content = Array.from({ length: 9 }, (_, index) => `記録${index + 1}：確認したこと`).join('\n');
+  let editor: Locator;
+  if (kind === 'memo') editor = await openMarkdown(page, content);
+  else {
+    await connectTestVault(page);
+    await page.evaluate(text => { window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content = '# 2026-11-19\n\n' + text; }, content);
+    await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+    editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true });
+  }
+  await expect(editor).toBeVisible();
+  async function bottom() {
+    await editor!.evaluate(element => { const scroller = element.closest('.cm-scroller')!; scroller.scrollTop = scroller.scrollHeight; });
+    return editor!.evaluate(element => {
+      const scroller = element.closest('.cm-scroller')!, bounds = scroller.getBoundingClientRect(), last = element.querySelector('.cm-line:last-child')!.getBoundingClientRect();
+      const style = getComputedStyle(element);
+      return { bottom: last.bottom - bounds.top, line: parseFloat(style.lineHeight), top: parseFloat(style.paddingTop), scroll: scroller.scrollTop };
+    });
+  }
+  await expect.poll(async () => { const value = await bottom(); return Math.abs(value.bottom - 3 * value.line); }).toBeLessThan(3);
+  expect((await bottom()).scroll).toBeGreaterThan(80);
+  const offset = await editor.evaluate(element => element.closest('.cm-scroller')!.scrollTop);
+  if (kind === 'memo') {
+    await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click({ modifiers: ['Control'] });
+    await page.getByRole('tab', { name: '試験の手順', exact: true }).click();
+  } else {
+    await page.getByRole('navigation', { name: 'メモ', exact: true }).getByRole('button', { name: '試験の手順', exact: true }).click({ modifiers: ['Control'] });
+    await page.getByRole('tab', { name: '耐久性評価', exact: true }).click();
+  }
+  await expect.poll(() => editor.evaluate(element => element.closest('.cm-scroller')!.scrollTop)).toBeCloseTo(offset, 0);
+  await page.setViewportSize({ width: 1100, height: 650 });
+  await expect.poll(async () => { const value = await bottom(); return Math.abs(value.bottom - 3 * value.line); }).toBeLessThan(3);
+  await page.keyboard.press('Control+s');
+  const saved = await page.evaluate(kind => window.__laminaFixture.files[kind === 'memo' ? 'メモ/試験の手順.md' : 'テーマ/耐久性評価/2026-11.md'].content, kind);
+  expect(saved).toBe(kind === 'memo' ? content : '# 2026-11-19\n\n' + content);
+  await page.screenshot({ path: `.tools/qa/scroll-past-end-${kind}.png` });
+});
+
+for (const prefix of ['- ', '- [ ] ', '    - ', '    - [x] ', '12. ']) test(`${prefix}の折り返した本文と先頭行を揃え、記号を最初の行に置く`, async ({ page }) => {
+  const text = '長い項目の本文を折り返しても、同じ開始位置から読み進められます。'.repeat(7);
+  const nested = prefix.startsWith(' ') ? '- 親項目\n' : '';
+  const editor = await openMarkdown(page, '# 確認\n\n' + nested + prefix + text + '\n\n末尾');
+  await editor.press('Control+End');
+  const line = editor.locator('.cm-list-line').filter({ hasText: text }); await expect(line).toHaveCount(1);
+  const positions = await line.evaluate((element, prefixLength) => {
+    const nodes: Text[] = [], walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) nodes.push(walker.currentNode as Text);
+    const rows = new Map<number, number>(); let offset = 0;
+    for (const node of nodes) for (let i = 0; i < node.length; i++, offset++) {
+      if (offset < prefixLength) continue;
+      const range = document.createRange(); range.setStart(node, i); range.setEnd(node, i + 1); const rect = range.getBoundingClientRect();
+      const row = Math.round(rect.top); if (!rows.has(row)) rows.set(row, rect.left);
+    }
+    const checkbox = element.querySelector('input[type=checkbox]')?.getBoundingClientRect();
+    return { rows: [...rows].map(([top, left]) => ({ top, left })), checkboxTop: checkbox?.top };
+  }, prefix.length);
+  expect(positions.rows.length).toBeGreaterThan(1);
+  for (const row of positions.rows.slice(1)) expect(Math.abs(row.left - positions.rows[0].left)).toBeLessThan(1.5);
+  if (positions.checkboxTop !== undefined) expect(Math.abs(positions.checkboxTop - positions.rows[0].top)).toBeLessThan(8);
+  await line.click(); await editor.press('Home'); await editor.press('End'); await editor.press('ArrowDown'); await editor.press('ArrowUp');
+  await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('# 確認\n\n' + nested + prefix + text + '\n\n末尾');
+  if (prefix === '- [ ] ') await page.screenshot({ path: '.tools/qa/wrapped-checklist.png' });
+});
+
+test('右クリックで選択した全行を箇条書き・タスクへ変換し、状態とUndoを保つ', async ({ page }) => {
+  const original = '一行目\n\n- [x] 二行目\n3. 三行目';
+  const editor = await openMarkdown(page, original);
+  await editor.press('Control+a');
+  await editor.locator('.cm-line').first().click({ button: 'right', position: { x: 50, y: 12 } });
+  const menu = page.getByRole('menu', { name: '本文の編集', exact: true }); await expect(menu).toBeVisible();
+  await menu.getByRole('menuitem', { name: 'チェックボックスに変換', exact: true }).click();
+  await expect(editor.getByRole('checkbox')).toHaveCount(4); await expect(editor.getByRole('checkbox', { name: '二行目', exact: true })).toBeChecked();
+  await expect(editor).toBeFocused(); await editor.press('Control+s');
+  const saved = () => page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content);
+  await expect.poll(saved).toBe('- [ ] 一行目\n- [ ] \n- [x] 二行目\n- [ ] 三行目');
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: 'チェックボックスに変換', exact: true }).click();
+  await editor.press('Control+z'); await expect.poll(async () => { await editor.press('Control+s'); return saved(); }).toBe(original);
+  await editor.press('Control+a'); await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '箇条書きに変換', exact: true }).click();
+  await editor.press('Control+s'); await expect.poll(saved).toBe('- 一行目\n- \n- 二行目\n- 三行目');
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '箇条書きに変換', exact: true }).click();
+  await editor.press('Control+s'); await expect.poll(saved).toBe('- 一行目\n- \n- 二行目\n- 三行目');
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(original);
+});
+
+test('右クリックの一括変換は月境界・見出し・コード・YAMLを保持して各月に保存する', async ({ page }) => {
+  await connectTestVault(page);
+  const old = '# 2026-10-31\n\n先月の行\n先月の次の行', recent = '---\ntitle: 記録\n---\n# 2026-11-19\n\n今月の行\n```md\n- コード\n```';
+  await page.evaluate(({ old, recent }) => { window.__laminaFixture.files['テーマ/耐久性評価/2026-10.md'].content = old; window.__laminaFixture.files['テーマ/耐久性評価/2026-11.md'].content = recent; }, { old, recent });
+  await page.getByRole('navigation', { name: 'テーマ', exact: true }).getByRole('button', { name: '耐久性評価', exact: true }).click();
+  const editor = page.getByRole('textbox', { name: '耐久性評価の本文', exact: true }); await editor.press('Control+a'); await editor.press('Shift+F10');
+  const menu = page.getByRole('menu', { name: '本文の編集', exact: true }); await menu.getByRole('menuitem', { name: 'チェックボックスに変換', exact: true }).click();
+  await editor.press('Control+s');
+  const saved = () => page.evaluate(() => ['2026-10', '2026-11'].map(month => window.__laminaFixture.files[`テーマ/耐久性評価/${month}.md`].content));
+  await expect.poll(saved).toEqual([old.replace('\n\n先月の行\n先月の次の行', '\n- [ ] \n- [ ] 先月の行\n- [ ] 先月の次の行'), recent.replace('\n\n今月の行', '\n- [ ] \n- [ ] 今月の行')]);
+  await expect(editor.locator('.month-divider')).toHaveCount(2);
+  await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toEqual([old, recent]);
+});
+
+test('本文メニューをEscで閉じ、画面端で収め、コピー・切り取り・貼り付けを維持する', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  const editor = await openMarkdown(page, '元の文章'); await editor.press('Control+a'); await editor.press('Shift+F10');
+  const menu = page.getByRole('menu', { name: '本文の編集', exact: true }); await menu.getByRole('menuitem', { name: 'コピー', exact: false }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('元の文章');
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '切り取り', exact: false }).click(); await expect(editor).toHaveText('');
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click(); await expect(editor).toHaveText('元の文章');
+  await editor.evaluate(element => element.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: innerWidth - 2, clientY: innerHeight - 2 })));
+  const bounds = (await menu.boundingBox())!; expect(bounds.x + bounds.width).toBeLessThanOrEqual(1280); expect(bounds.y + bounds.height).toBeLessThanOrEqual(860);
+  await menu.getByRole('menuitem', { name: 'コピー', exact: false }).press('Escape'); await expect(menu).not.toBeVisible(); await expect(editor).toBeFocused();
+  await editor.press('Shift+F10'); await page.screenshot({ path: '.tools/qa/editor-context-menu.png' });
+});
+
+test('本文メニューの貼り付けで画像とHTMLの資料名を既存の挿入処理へ渡す', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  const editor = await openMarkdown(page, '本文\n\n'); await editor.press('Control+End');
+  await page.evaluate(async () => {
+    const canvas = document.createElement('canvas'); canvas.width = 100; canvas.height = 60;
+    canvas.getContext('2d')!.fillRect(0, 0, 100, 60);
+    const blob = await new Promise<Blob>(resolve => canvas.toBlob(value => resolve(value!), 'image/png'));
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+  });
+  await editor.press('Shift+F10'); const menu = page.getByRole('menu', { name: '本文の編集', exact: true });
+  await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click(); await expect(editor.locator('.cm-image-frame.image-ready')).toHaveCount(1);
+  await editor.press('Control+End'); await editor.press('Enter');
+  await page.evaluate(async () => {
+    const url = 'https://team.sharepoint.com/:x:/s/Dev/context';
+    await navigator.clipboard.write([new ClipboardItem({ 'text/plain': new Blob([url], { type: 'text/plain' }), 'text/html': new Blob([`<a href="${url}">評価結果.xlsx</a>`], { type: 'text/html' }) })]);
+  });
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click();
+  const dialog = page.getByRole('dialog', { name: '資料を登録', exact: true }); await expect(dialog.getByRole('textbox', { name: '資料名', exact: true })).toHaveValue('評価結果.xlsx');
+  await dialog.getByRole('button', { name: '登録して挿入', exact: true }).click(); await editor.press('Control+s');
+  expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toContain('context');
+});
+
+test('本文メニューでExplorer形式のファイルコピーを読み、複数ファイルは挿入しない', async ({ page }) => {
+  const editor = await openMarkdown(page, '本文\n\n'); await editor.press('Control+End');
+  await page.evaluate(() => {
+    Object.defineProperty(navigator.clipboard, 'read', { configurable: true, value: async () => [] });
+    window.__laminaFixture.clipboard = { paths: ['C:\\試験\\評価.xlsx'], title: '評価結果.xlsx', text: null };
+  });
+  await editor.press('Shift+F10'); const menu = page.getByRole('menu', { name: '本文の編集', exact: true }); await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click();
+  const dialog = page.getByRole('dialog', { name: '資料を登録', exact: true }); await expect(dialog.getByRole('textbox', { name: '資料名', exact: true })).toHaveValue('評価結果.xlsx');
+  await expect(dialog.getByRole('textbox', { name: '資料のパス・URL', exact: true })).toHaveValue('C:\\試験\\評価.xlsx');
+  await dialog.getByRole('button', { name: 'キャンセル', exact: true }).click(); await expect(dialog).not.toBeVisible();
+  await page.evaluate(() => { window.__laminaFixture.clipboard = { paths: ['C:\\試験\\a.pdf', 'C:\\試験\\b.pdf'], title: null, text: null }; });
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click();
+  await expect(page.getByRole('alert')).toContainText('資料は1件ずつ'); await expect(dialog).not.toBeVisible();
+  await editor.press('Control+s'); expect(await page.evaluate(() => window.__laminaFixture.files['メモ/試験の手順.md'].content)).toBe('本文\n\n');
+  await page.evaluate(() => { window.__laminaFixture.clipboard = { paths: [], title: null, text: null }; });
+  await editor.press('Shift+F10'); await menu.getByRole('menuitem', { name: '貼り付け', exact: false }).click();
+  await page.clock.runFor(80); await expect(editor).toBeFocused(); await expect(page.getByRole('alert')).toHaveCount(0); await expect(dialog).not.toBeVisible();
+});
+
+test('リスト内の資料アイコンと画像の操作ボタンも折り返し位置からはみ出さない', async ({ page }) => {
+  const url = 'https://example.com/list-material';
+  const editor = await openMarkdown(page, `- [ ] [評価表](${url})\n- ![測定図](../添付/list-context/rendered.png)\n\n末尾`);
+  await page.evaluate(content => {
+    window.__laminaFixture.files['資料/評価表.md'] = { content, revision: 'list-resource' };
+    const canvas = document.createElement('canvas'); canvas.width = 180; canvas.height = 100;
+    window.__laminaFixture.images['添付/list-context/rendered.png'] = { path: '添付/list-context/rendered.png', data: canvas.toDataURL('image/png').split(',')[1], mime: 'image/png', revision: 'list-image', annotation: null, original: null };
+  }, writeMaterial({ ...materialDraft(url), title: '評価表' }));
+  await page.getByRole('button', { name: '保管庫を再読み込み', exact: true }).click(); await expect(page.locator('.app-shell')).not.toHaveAttribute('inert', ''); await editor.press('Control+End');
+  const group = editor.locator('.cm-material'); await expect(group).toHaveCount(1);
+  const bounds = await group.evaluate(element => ({ group: element.getBoundingClientRect().left, icon: element.querySelector('svg')!.getBoundingClientRect().left }));
+  expect(bounds.icon).toBeGreaterThanOrEqual(bounds.group - 1);
+  const image = editor.locator('.cm-image-frame.image-ready'); await expect(image).toHaveCount(1); await image.hover();
+  const buttons = await image.locator('.image-tools button').evaluateAll(elements => elements.map(element => {
+    const range = document.createRange(); range.selectNodeContents(element);
+    return { button: element.getBoundingClientRect().left, text: range.getBoundingClientRect().left };
+  }));
+  expect(buttons.length).toBeGreaterThan(0); expect(buttons.every(bounds => bounds.text >= bounds.button - 1)).toBeTruthy();
+});
+
 test('タスクをチェックボックスで描画し、クリック・Ctrl+L・UndoでもMarkdownを保つ', async ({ page }) => {
   const content = '# タスク\n- [ ] 未完了\n- [x] 完了\n    - [ ] 子項目\n\n通常の本文';
   const editor = await openMarkdown(page, content);
@@ -496,6 +669,7 @@ test('タスクをチェックボックスで描画し、クリック・Ctrl+L�
   await editor.press('Control+z'); await editor.press('Control+s'); await expect.poll(saved).toBe(content);
   await editor.locator('.cm-line').filter({ hasText: /^- \[ \] 未完了$/ }).click(); await editor.press('End'); await editor.press('Control+l');
   await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).toBeChecked();
+  await editor.press('Control+l'); await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).toHaveCount(0);
   await editor.press('Control+l'); await expect(editor.getByRole('checkbox', { name: '未完了', exact: true })).not.toBeChecked();
   await editor.press('Control+End'); await editor.press('Control+l');
   await expect(editor.getByRole('checkbox', { name: '通常の本文', exact: true })).not.toBeChecked();
@@ -529,6 +703,9 @@ test('チェック項目を含む月次ページで上下・クリック位置�
   for (let i = 1; i < lines.length; i++) { await editor.press('ArrowDown'); await expect.poll(currentLine).toBe(lines[i]); }
   await editor.locator('.cm-line').filter({ hasText: '確認 12' }).click(); await editor.press('Home');
   expect((await caretPosition(editor)).offset).toBe(6);
+  await editor.press('Control+l');
+  await expect(editor.getByRole('checkbox', { name: '確認 12', exact: true })).toHaveCount(0);
+  expect((await caretPosition(editor)).offset).toBe(2);
   await editor.press('Control+l');
   await expect(editor.getByRole('checkbox', { name: '確認 12', exact: true })).not.toBeChecked();
   await editor.getByRole('checkbox', { name: '確認 12', exact: true }).click();

@@ -2,18 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { EditorSelection, EditorState } from '@codemirror/state';
 import { compose, fromDisk } from '../../domain/documents';
 import { sourceFilesField } from './source-model';
-import { markdownTaskToggle, taskMarker } from './task-list';
+import { addTaskCheckboxes, markdownTaskToggle, taskMarker } from './task-list';
 
 function editor(content: string, all = false) {
   const file = fromDisk({ path: 'メモ/記録.md', content, revision: 'r' });
   let state = EditorState.create({ doc: content, selection: EditorSelection.single(all ? 0 : content.length, content.length), extensions: [sourceFilesField.init(() => [file])] });
-  return { run() { markdownTaskToggle({ state, dispatch: tr => { state = tr.state; } }); }, text: () => state.doc.toString(), state: () => state };
+  return { run(command = markdownTaskToggle) { command({ state, dispatch: tr => { state = tr.state; } }); }, text: () => state.doc.toString(), state: () => state };
 }
 describe('タスクの作成と切り替え', () => {
-  it('通常行を未完了に変え、以後は完了・未完了を切り替える', () => {
+  it('通常行を未完了に変え、完了・チェック欄なしの3状態で循環する', () => {
     const edit = editor('確認する'); edit.run(); expect(edit.text()).toBe('- [ ] 確認する');
     expect(edit.state().selection.main.head).toBe(edit.text().length);
     edit.run(); expect(edit.text()).toBe('- [x] 確認する');
+    edit.run(); expect(edit.text()).toBe('- 確認する');
     edit.run(); expect(edit.text()).toBe('- [ ] 確認する');
   });
   it('空行・箇条書き・番号・引用・子項目でも既存の階層と記号を保持する', () => {
@@ -21,11 +22,11 @@ describe('タスクの作成と切り替え', () => {
       const edit = editor(text); edit.run(); expect(edit.text()).toBe(expected);
     }
   });
-  it('複数選択はまとめて作成し、混在した完了状態は全て完了→全て未完了に揃える', () => {
+  it('複数選択はまとめて作成し、混在した完了状態は全て完了→全てチェック欄なしに揃える', () => {
     const edit = editor('一\n- 二\n- [x] 三', true); edit.run();
     expect(edit.text()).toBe('- [ ] 一\n- [ ] 二\n- [x] 三');
     edit.run(); expect(edit.text()).toBe('- [x] 一\n- [x] 二\n- [x] 三');
-    edit.run(); expect(edit.text()).toBe('- [ ] 一\n- [ ] 二\n- [ ] 三');
+    edit.run(); expect(edit.text()).toBe('- 一\n- 二\n- 三');
   });
   it('見出し・YAML・コード・HTMLは書き換えない', () => {
     const text = '---\nname: 値\n---\n# 題名\n```md\n- [ ] コード\n```\n\n    - [ ] インデントコード\n\n<div>\n- 本文\n</div>';
@@ -48,6 +49,16 @@ describe('タスクの作成と切り替え', () => {
   it('大文字Xと空項目はタスクとして扱い、コード風文字や行の中の記号は誤認しない', () => {
     for (const text of ['- [ ] ', '- [X] 完了', '1. [x] 完了', '- [ ]']) expect(taskMarker(text, text.indexOf(' ') )).not.toBeNull();
     for (const text of ['- [a] text', '- [ ]text', '- 本文 [ ]']) expect(taskMarker(text, 1)).toBeNull();
-    const edit = editor('- [X] 完了'); edit.run(); expect(edit.text()).toBe('- [ ] 完了');
+    const edit = editor('- [X] 完了'); edit.run(); expect(edit.text()).toBe('- 完了');
+  });
+  it('番号・引用・入れ子と空項目ではチェック欄だけを外す', () => {
+    for (const [text, expected] of [['1. [x] 完了', '1. 完了'], ['> - [X] 完了', '> - 完了'], ['- 親\n    - [x] 子', '- 親\n    - 子'], ['- [x]', '- ']]) {
+      const edit = editor(text); edit.run(); expect(edit.text()).toBe(expected); expect(edit.state().selection.main.head).toBe(expected.length);
+    }
+  });
+  it('明示的な変換は選択内の空行も変換し、完了済みの項目を維持して冪等になる', () => {
+    const edit = editor('一\n\n- [x] 二\n3. 三', true); edit.run(addTaskCheckboxes);
+    expect(edit.text()).toBe('- [ ] 一\n- [ ] \n- [x] 二\n- [ ] 三');
+    edit.run(addTaskCheckboxes); expect(edit.text()).toBe('- [ ] 一\n- [ ] \n- [x] 二\n- [ ] 三');
   });
 });
